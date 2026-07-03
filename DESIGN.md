@@ -14,7 +14,6 @@ secondary database. Correctness rests on two S3 guarantees:
 - Append events to a named stream with optimistic concurrency (`expectedVersion`).
 - Read a stream in order, as an async iterable.
 - Atomic multi-event appends (all-or-nothing per commit).
-- Snapshots.
 - Pluggable serialization, metadata (correlation/causation IDs), upcasting hooks.
 - Zero runtime dependencies; pluggable **storage drivers** — `@aws-sdk/client-s3`
   is an optional peer of the Node driver only, never a core dependency
@@ -57,17 +56,32 @@ zero-padded so lexicographic order equals numeric order:
 
 ```
 {prefix}/streams/{streamId}/e/{baseVersion:012d}.json
-{prefix}/streams/{streamId}/s/{version:012d}.json      # snapshots
-{prefix}/streams/{streamId}/c/{from:012d}-{to:012d}.json  # compacted chunks (see Compaction)
+{prefix}/streams/{streamId}/c/{chunkBase:012d}.json    # compacted chunks; chunkBase = k·N (see Compaction)
 {prefix}/streams/{streamId}/head.json                  # non-authoritative hint
 ```
+
+The library owns only the `streams/` subtree under `{prefix}` — every LIST
+it issues is scoped to `{prefix}/streams/{streamId}/e|c/` — so unrelated
+application objects can live as siblings under the same prefix
+(`app-x/streams/…` next to `app-x/attachments/…`) with zero interaction.
+Two rules: nothing else may write below `{prefix}/streams/` (a foreign
+object under `e/` would be parsed as a commit by head discovery), and
+`streamId` contains no slashes — namespacing lives in the prefix, identity
+in the id. Prefixes follow the same no-PII rule as stream IDs (see Erasure).
 
 **Append protocol**
 
 1. Resolve the stream head (current version) — see Head discovery below.
 2. `PutObject` the commit object at key `e/{head+1}` with `If-None-Match: *`.
-3. On HTTP 412: another writer won the race → raise `ConcurrencyError`
-   (caller retries: re-read, re-decide, re-append).
+   The body carries a writer-generated `commitId`.
+3. On HTTP 412: GET the key just targeted and compare `commitId`. If it is
+   ours, we already won — the original PUT succeeded but its response was
+   lost, and the transport-level retry collided with our own object; report
+   success. (Without this check, a retried conditional PUT is
+   indistinguishable from a lost race, and a timed-out-but-successful append
+   surfaces as `ConcurrencyError` — the caller re-reads, sees its own events,
+   and may double-append.) Otherwise another writer won → raise
+   `ConcurrencyError` (caller retries: re-read, re-decide, re-append).
 4. Best-effort update `head.json` (plain PUT, last-writer-wins; it is only a
    hint, never trusted for correctness).
 
@@ -80,6 +94,7 @@ from the caller just selects which key we attempt.
 
 ```jsonc
 {
+  "commitId": "uuid",            // writer-generated; disambiguates retried conditional PUTs
   "streamId": "order-123",
   "baseVersion": 5,
   "events": [
@@ -107,8 +122,11 @@ come from reading, never from key arithmetic.
 - Cold path (no hint): paginate LIST over the `e/` prefix (1000 keys/page).
 - If the conditional PUT 412s, the head moved — re-list from the hint and retry.
 
-**Read protocol**: LIST the `e/` prefix (optionally `StartAfter` a snapshot
-version), GET each commit object, yield events. Expose as
+**Read protocol**: LIST the `e/` prefix, GET each commit object, yield
+events. A `fromVersion` may fall mid-commit (keys encode *base* versions), so
+never `StartAfter` a raw version number — start the LIST at a known commit
+boundary (stream start, or a chunk's recorded last commit key) and trim
+locally. Expose as
 `AsyncIterable<EventEnvelope>` with internal prefetch (parallel GETs, bounded
 concurrency) to hide S3 latency.
 
@@ -121,7 +139,7 @@ import { awsSdkDriver } from "s3-event-store/drivers/aws-sdk";
 
 const store = createEventStore({
   driver: awsSdkDriver({ client: new S3Client({}), bucket: "my-events" }),
-  prefix: "prod",                    // multi-tenancy / env isolation
+  prefix: "prod",                    // multi-tenancy / env isolation / app grouping
   serializer: jsonSerializer(),      // pluggable (compression, encryption)
 });
 
@@ -134,15 +152,10 @@ const result = await store.append("order-123", [
 // Read
 for await (const e of store.read("order-123", { fromVersion: 0 })) { ... }
 
-// Snapshots
-await store.writeSnapshot("order-123", { version: 40, state });
-const snap = await store.readSnapshot("order-123");
-
 // Optional higher-level aggregate helper (separate entry point)
 const repo = createRepository(store, {
   evolve: (state, event) => ...,
   init: () => ...,
-  snapshotEvery: 50,
 });
 const { state, version } = await repo.load("order-123");
 await repo.save("order-123", version, newEvents);
@@ -155,7 +168,9 @@ await repo.save("order-123", version, newEvents);
 - number `n` → commit must land at version `n+1`
 - `"noStream"` → stream must not exist (PUT at version 0)
 - `"any"` → resolve head and retry the conditional PUT on 412 up to a bounded
-  retry count (still atomic, just relaxed intent)
+  retry count (still atomic, just relaxed intent). The `commitId` self-check
+  makes this loop idempotent: a lost-response retry is recognized as our own
+  commit, never re-appended at a new version.
 
 ## Subscriptions / projections (v2)
 
@@ -182,22 +197,39 @@ critical path.
 **Invariant: every event is readable from at least one object at every
 instant.** All ordering below exists to preserve it.
 
-Chunk boundaries are **fixed-width and deterministic** — chunk *k* covers
-versions `[k·N, k·N+N−1]` (N = 1000 default), so any compactor computes the
-same key for the same range without coordination.
+Chunk membership is **by commit baseVersion, fixed-width and deterministic** —
+chunk *k* holds every commit whose *base* falls in `[k·N, k·N+N−1]`, keyed
+`c/{k·N:012d}`. Membership by base, not by event version: a multi-event
+commit whose events straddle `k·N+N−1` belongs wholly to chunk *k*, whose
+actual coverage then extends past the nominal boundary (recorded in the
+chunk body, along with its last commit key). This makes every commit live in
+exactly one chunk, so "delete the source commit once its chunk exists" is
+always safe. Slicing by event version instead would let a straddling commit
+be needed by two chunks and deleted after only the first exists — data loss.
+Any compactor still computes the same key for the same bucket without
+coordination.
+
+**Chunk size N = 500, fixed per store.** The Workers deployment runs
+compaction inside `waitUntil`, which shares the invoking request's
+~1,000-subrequest budget (R2 binding calls count); one chunk costs ~N GETs +
+1 PUT + 1 batched DELETE, so N = 500 leaves headroom for the request's own
+work. N is a store-level constant: chunk keys and REST page URLs derive from
+it, so changing it under existing data means a full recompaction — pick once,
+record it in store config.
 
 **Compactor steps (per stream):**
 
 1. LIST `c/` to find the last chunk; LIST `e/` for uncompacted commits.
-2. Select the next chunk range only if **complete** (all versions present as
-   commits) and **cold** — at least one full chunk behind the head (compact
-   chunk *k−1* once chunk *k* has started). The lag is structural, not
-   clock-based: the compacted range is always ≥ N commits behind the hot tail
-   where appends and head-hint readers operate.
-3. GET the range's commits, write one chunk object with `If-None-Match: *`.
-4. Only after the chunk PUT succeeds, DELETE the source commit objects.
-5. Sweep: delete any commit whose version is covered by an existing chunk
-   (garbage from a crash between 3 and 4).
+2. Select bucket *k* only once bucket *k+1* has started (a commit with base
+   ≥ (k+1)·N exists). Bases progress densely, so the bucket is then
+   **sealed** — it can never gain another commit — and it sits behind the hot
+   tail where appends and head-hint readers operate. The lag is structural,
+   not clock-based.
+3. GET the bucket's commits, write one chunk object with `If-None-Match: *`.
+4. Only after the chunk PUT succeeds, batch-DELETE the source commit objects
+   (`DeleteObjects` / the binding's array `delete` — one call, ≤1000 keys).
+5. Sweep: delete any commit whose baseVersion falls in an existing chunk's
+   bucket (garbage from a crash between 3 and 4).
 
 **Failure modes, all harmless:**
 
@@ -211,11 +243,12 @@ same key for the same range without coordination.
   strictly precedes deletes, so the data is always in one of the two places.
 
 **Reader path with chunks:** LIST `c/` (few keys) → GET relevant chunks →
-LIST `e/` with `StartAfter` the last chunk's end → GET tail commits, ignoring
-any commit already covered by a chunk. A 1M-event replay becomes ~1k chunk
-GETs plus a short tail.
+LIST `e/` with `StartAfter` the last chunk's last commit key (recorded in the
+chunk body) → GET tail commits, ignoring any commit whose base falls in an
+existing chunk's bucket. A 1M-event replay becomes ~2k chunk GETs plus a
+short tail.
 
-**Cost:** per 1k-commit chunk ≈ 1k GETs + 1 PUT + 1k DELETEs. DELETEs are free
+**Cost:** per chunk ≈ N GETs + 1 PUT + 1 batched DELETE. DELETEs are free
 on S3 and R2, so compaction runs at roughly a tenth of the original write
 cost, amortized in the background. On versioned buckets DELETE only adds a
 delete marker — add a lifecycle rule expiring noncurrent versions (storage
@@ -224,7 +257,7 @@ cost only; readers only see current versions).
 **Interactions:** compaction never touches keys at or above the head, so it
 cannot conflict with appends — the write path doesn't know it exists. It
 copies payload bytes verbatim, so it works on encrypted payloads without any
-key-store access (keeps compactor IAM minimal). Snapshots are orthogonal.
+key-store access (keeps compactor IAM minimal).
 
 **Scheduling — write/read-driven, no cron.** Sloppy triggering is safe by
 construction (deterministic keys + `If-None-Match` + sweep make duplicate or
@@ -234,7 +267,7 @@ that already run:
 - **Write-triggered (primary):** after a successful append, the writer checks
   the trigger condition with pure arithmetic (it knows the version it just
   wrote) and fires `ctx.waitUntil(compactStream(id))` — response returns
-  immediately, ~1k I/O-bound GETs run in background time. The condition is
+  immediately, ~N I/O-bound GETs run in background time. The condition is
   **state-derived, not event-derived**: "a complete, uncompacted chunk exists
   behind the head" (tracked as a `compactedTo` watermark piggybacked on
   `head.json`, which the append path already writes) — so a died `waitUntil`
@@ -276,12 +309,13 @@ the deployment wires them into its append/read handlers (or the queue).
 
 - PUT/LIST ≈ $0.005 per 1k, GET ≈ $0.0004 per 1k. An aggregate with 1M commits
   costs ~$5 to write, storage is negligible. Reads dominated by request count →
-  snapshots and commit batching matter more than payload size.
+  commit batching and compaction matter more than payload size.
 - Append latency ≈ 1 GET (hint) + 1 LIST + 1 PUT ≈ 60–150 ms on standard S3.
   Cache the head in-process per stream to make hot-stream appends ≈ 1 PUT.
 - Long streams: reading 10k commits = 10k GETs. Mitigations, in order:
-  snapshots (v1), background **compaction** into chunk objects (see Compaction
-  protocol), and encouraging small aggregates (docs).
+  background **compaction** into chunk objects (see Compaction protocol —
+  with no snapshot layer it is the primary replay mitigation, hence early in
+  the roadmap), and encouraging small aggregates (docs).
 - **S3 Express One Zone backend** (later): single-digit-ms PUT/GET, supports
   conditional writes; trade-off is one-AZ durability and directory-bucket LIST
   semantics — offer as an opt-in backend behind the same interface.
@@ -421,7 +455,7 @@ Reference deployment: Cloudflare Workers + R2 (Lambda + S3 is structurally
 identical).
 
 **Write path — always through a worker.** It authenticates, rehydrates the
-aggregate (snapshot + tail), enforces invariants, performs the conditional
+aggregate (chunks + tail), enforces invariants, performs the conditional
 PUT. Nothing else holds write credentials to the event bucket.
 
 **Read path — worker-gated too, but not for cost reasons.** The math: a
@@ -430,8 +464,8 @@ of route; the worker adds one request ≈ $0.30/M (~2% overhead). The worker
 actually *lowers* read cost: commit and chunk objects are immutable →
 cache-forever in the edge cache (Cache API), so hot streams and repeated
 replays stop hitting R2 entirely. Head discovery (one LIST) is the only
-intrinsically uncacheable step. The real read-cost levers are snapshots,
-compaction, and edge caching — not bypassing the worker. What forces the
+intrinsically uncacheable step. The real read-cost levers are compaction and
+edge caching — not bypassing the worker. What forces the
 worker is authorization (presigning is per-object and needs a trusted call
 anyway) and decryption (clients never touch the key store).
 
@@ -499,7 +533,7 @@ client reads are stream-shaped. Cross-stream queries add them later (roadmap
 phase 4); nothing below needs rework when they arrive.
 
 **1. Core library (the npm package)** — the only shipped software. Storage
-drivers, event store (append/read/snapshots), repository helper, serializers
+drivers, event store (append/read), repository helper, serializers
 (incl. the encrypting one), `KeyStore` interface + S3-bucket implementation,
 `compactStream()` + trigger check, shred workflow helpers. A dependency,
 never a service — it owns no process.
@@ -507,7 +541,7 @@ never a service — it owns no process.
 **2. Application worker (deployment code)** — thin HTTP handlers over the
 library:
 
-- Command endpoints: authenticate → rehydrate (snapshot + tail) → enforce
+- Command endpoints: authenticate → rehydrate (chunks + tail) → enforce
   invariants → `append` → `waitUntil` compaction trigger.
 - Read endpoints: events (plaintext or ciphertext per read model), key
   delivery (model B).
@@ -542,11 +576,35 @@ compaction variant is adopted.
 commands rather than raw append):
 
 ```
-POST /streams/{id}/append          command endpoint; validated events in, AppendResult out
-GET  /streams/{id}/events?from=v   events (A) or ciphertext envelopes (B), + next cursor
-GET  /streams/{id}/head            current version — the poll target
-GET  /streams/{id}/key             wrapped data key + TTL          (model B only)
+POST /{prefix...}/streams/{id}/append         command endpoint; validated events in, AppendResult out
+GET  /{prefix...}/streams/{id}/events?from=v  events (A) or ciphertext envelopes (B), + next cursor
+GET  /{prefix...}/streams/{id}/head           current version — the poll target
+GET  /{prefix...}/streams/{id}/key            data key + TTL              (model B only)
 ```
+
+**Prefix routing.** `{prefix...}` is one or more path segments mapped
+**verbatim** onto the S3 key prefix
+(`/app-x/orders/streams/order-123/events` →
+`app-x/orders/streams/order-123/e/…`), so deployments can group related
+application data — event-sourced or not — under shared prefixes (see the
+ownership-boundary rule in Key layout). The worker resolves the prefix to a
+store instance; stores are stateless beyond the head cache, so a per-prefix
+factory is trivial. Link-following makes the extra segments free: clients
+never construct URLs, cache keys *are* URLs, so pages from different
+prefixes are simply distinct permanent cache entries. Rules:
+
+1. **Verbatim path↔key mapping** — no aliasing or rewriting, or
+   redirect-to-canonical and link-following stop being mechanical.
+2. **Per-prefix config is per-store config** — N, serializer, key store may
+   vary by prefix (page URLs embed the prefix, so differing N values cannot
+   collide in the cache); uniform is still simpler.
+3. **A prefix is a grouping, not a consistency boundary** — no cross-stream
+   transactions within it (same non-goal as ever) — **and not an
+   enumeration API**: "all streams under app-x" is a projection, not a LIST.
+
+Side benefit: authorization tends to align with application grouping, so the
+worker gets a natural hook for per-app policy — path-prefix middleware,
+outside the library.
 
 Live updates = polling `GET head` (one cheap LIST behind it, short-TTL
 cacheable). SSE/WebSocket via Durable Objects is an optional deployment
@@ -562,14 +620,14 @@ load-bearing ideas survive here without the XML.
 {
   "streamId": "order-123",
   "from": 0,
-  "to": 999,
+  "to": 499,
   "complete": true,          // full page ⇒ served with Cache-Control: immutable
   "events": [
     { "id": "…", "type": "OrderShipped", "version": 5,
       "data": { … },         // model A — or "ciphertext": "base64…" in model B
       "meta": { "ts": "…", "correlationId": "…" } }
   ],
-  "next": "/streams/order-123/events?from=1000",  // absent ⇒ at head
+  "next": "/streams/order-123/events?from=500",   // absent ⇒ at head
   "prev": null                                    // page k−1; null on page 0
 }
 ```
@@ -586,11 +644,11 @@ load-bearing ideas survive here without the XML.
 - **`prev`** (RFC 5005's `prev-archive`) enables newest→oldest traversal.
   Page boundaries are deterministic, so page *k*'s `prev` is always page
   *k−1* — a complete page's envelope *including its links* stays immutable
-  and cache-forever (see Reverse and time-range reads).
+  and cache-forever (see Reverse reads).
 - **Redirect-to-canonical**: the one URL a client must construct is a cold
   resume from a stored cursor (`?from=372`, mid-page). The read handler
   responds `308` to the canonical page containing that version (`?from=0`
-  for page 0–999); the client SDK follows and skips locally to 372. One
+  for page 0–499); the client SDK follows and skips locally to 372. One
   redirect converts any entry point into the canonical URL space; everything
   after is link-following against permanent cache entries.
 - **Envelope field names are CloudEvents-compatible** (`id`, `type`, `time`,
@@ -605,7 +663,7 @@ load-bearing ideas survive here without the XML.
 Escape hatches, documented but not default: **NDJSON** (one event per line,
 pagination via `Link` headers) if pages grow enough that streaming-parse
 matters; a **binary content-type** per page if base64 inflation ever matters.
-At N = 1000 events per page, neither is needed.
+At N = 500 events per page, neither is needed.
 
 ### Compaction and the API
 
@@ -635,17 +693,17 @@ cached response is ever invalidated by compaction. Rules that make this hold:
 
 Net effect: a long replay streams almost entirely from the edge cache
 regardless of whether compaction has run; compaction only changes what a
-cache miss costs (~1 chunk GET vs ~1k commit GETs). The read-triggered
+cache miss costs (~1 chunk GET vs ~N commit GETs). The read-triggered
 compaction backstop lives in this same handler — the reader that pays the
 slow uncompacted path fires `waitUntil(compactStream(id))` on the way out,
 so the API is what heals uncompacted streams. Cache, API, and storage
 converge on the same unit: the chunk.
 
-### Reverse and time-range reads
+### Reverse reads
 
 Governing rule: **version space is the only physical coordinate.** Recency
-and time are *resolved to* version space, never made a second key scheme —
-no new storage layout, no new invalidation story.
+is *resolved to* version space, never made a second key scheme — no new
+storage layout, no new invalidation story.
 
 **Newest → oldest** — purely an envelope + SDK feature: client hits
 `GET head` (or the incomplete page), walks `prev` links through permanent
@@ -655,24 +713,15 @@ URLs, same cache entries, opposite order. "Most recent 20 events" is at most
 two page fetches (partial head page + one complete page). This serves
 activity feeds and audit views.
 
-**Time-range** — `?since=T&until=T'` is sugar that resolves each bound to a
-version via **binary search over canonical pages** (~log₂(head/N) fetches,
-each an edge-cache hit or a permanent new entry — ~10 for a 1M-event
-stream), then serves the same canonical pages; the client trims edge events.
-Timestamps stay data; versions stay coordinates.
-
-- *Monotonicity invariant:* binary search requires `committedAt` to never
-  decrease along a stream. The writer rehydrates before appending anyway, so
-  it clamps: `committedAt = max(now, prev.committedAt)`. One line in the
-  append path; the invariant becomes structural, not clock-dependent.
-- *Per-stream only:* "all events across the system in [T₁, T₂]" is the
-  global-feed problem this design deliberately excludes — that's
-  subscriptions/projections (phase 4). A time query without a `streamId` has
-  no home here; say so in the docs.
-- *Deferred upgrade path:* chunk objects (or a tiny per-stream index written
-  during compaction) could record `[firstTime, lastTime]` for O(1)
-  resolution. Binary search over cached pages is cheap enough that a real
-  workload must justify this first.
+**Time is data, not a coordinate.** There is no server-side time-range query
+(`?since=T`). `committedAt` and `meta.ts` come from writers' wall clocks and
+carry no monotonicity guarantee — clock skew between writers can make
+timestamps run backwards along a stream, and a server API over them would
+imply a precision the store cannot honestly provide. Clients that need time
+filtering scan by version and filter locally, treating timestamps as
+approximate; document this explicitly. ("All events across the system in
+[T₁, T₂]" is the global-feed problem this design deliberately excludes —
+that's subscriptions/projections, phase 4.)
 
 ## Roadmap
 
@@ -680,8 +729,8 @@ Timestamps stay data; versions stay coordinates.
 |-------|-------|
 | 0 | Scaffold: tsup, vitest, CI, key codec + envelope with 100% unit coverage |
 | 1 | Storage-driver interface + `r2-binding`/`aws-sdk`/`aws4fetch` drivers (incl. `onlyIf` conformance tests); `append`/`read` + optimistic concurrency + error taxonomy + integration tests |
-| 2 | Snapshots, head hints, in-process head cache, repository helper |
-| 3 | Compaction, S3 Express backend, compression + whole-payload crypto-shredding serializer with pluggable key store, browser client SDK (`./client`) |
+| 2 | Head hints, in-process head cache, repository helper, **compaction** (the replay mitigation, now snapshot-free) |
+| 3 | S3 Express backend, compression + whole-payload crypto-shredding serializer with pluggable key store, browser client SDK (`./client`) |
 | 4 | Subscriptions: checkpointed catch-up + EventBridge/SQS adapter |
 | 5 | Field-level encryption (fail-closed defaults), if demand warrants |
 
