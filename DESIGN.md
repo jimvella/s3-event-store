@@ -359,7 +359,14 @@ N; the cap also keeps REST page assembly cheap.
 3. GET the bucket's commits, write one chunk object with `If-None-Match: *`.
    A 404 on a source commit mid-GET means a racing winner is already
    deleting sources; its chunk necessarily exists (chunk PUT strictly
-   precedes deletes) — confirm the chunk and stand down.
+   precedes deletes) — confirm the chunk and stand down. The same race can
+   also complete entirely between step 1's two LISTs: the winner's deletes
+   land before the `e/` LIST, and the selected bucket arrives sealed but
+   **empty**. Also a stand-down, not corruption: an empty sealed bucket
+   whose chunk exists was compacted since the `c/` LIST — confirm the
+   chunk and stand down. Only sealed, empty, *and* chunkless is impossible
+   (bases are dense), and only that raises. (Found by the simulator's
+   randomized compactor races, not the original analysis.)
 4. Only after the chunk PUT succeeds, batch-DELETE the source commit objects
    (`DeleteObjects` / the binding's array `delete` — one call, ≤1000 keys).
 5. Sweep: delete garbage commits — leftovers of a crash between 3 and 4,
@@ -381,8 +388,8 @@ N; the cap also keeps REST page assembly cheap.
   Duplication, not corruption; readers dedupe (below), the sweep cleans up.
 - *Racing compactors* → deterministic boundaries mean identical chunk keys;
   `If-None-Match: *` picks one winner, the loser 412s and proceeds to deletes
-  (or stands down earlier via step 3's 404 rule). Same lock-free primitive
-  as the append path.
+  (or stands down earlier via step 3's 404 and empty-bucket rules). Same
+  lock-free primitive as the append path.
 - *Reader racing the deletes* → two shapes, both recoverable because chunk
   PUT strictly precedes deletes (the data is always in one of the two
   places). **GET-time**: a 404 on a commit the reader just LISTed means
