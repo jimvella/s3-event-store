@@ -55,7 +55,26 @@ export interface EventStore {
   read(streamId: string, opts?: ReadOptions): AsyncIterable<EventEnvelope>;
   /** Resolve the current head version, or "noStream". Exposed for tests. */
   resolveHead(streamId: string): Promise<HeadResolution>;
+  /**
+   * Compact the lowest sealed uncompacted bucket, if any (at most one per
+   * invocation — DESIGN.md, Compaction). Safe under sloppy triggering:
+   * duplicate and racing invocations are harmless by construction.
+   */
+  compactStream(streamId: string): Promise<CompactionResult>;
+  /**
+   * Delete sub-watermark garbage commits (crash leftovers, freed-key
+   * recreations). Hygiene, not correctness; scans from the stream start.
+   */
+  sweepStream(streamId: string): Promise<{ deleted: number }>;
 }
+
+export type CompactionResult =
+  /** This invocation created the chunk and deleted the sources. */
+  | { status: "compacted"; chunkBase: number }
+  /** A racing compactor won this bucket; state is already correct. */
+  | { status: "stood-down"; chunkBase: number }
+  /** No sealed uncompacted bucket exists behind the head. */
+  | { status: "nothing-to-do" };
 
 export type HeadResolution =
   | { kind: "noStream" }
@@ -346,5 +365,94 @@ export function createEventStore(config: EventStoreConfig): EventStore {
     }
   }
 
-  return { append, read, resolveHead };
+  /**
+   * Compactor steps 1-4 (DESIGN.md, "Compactor steps"). Lock-free: the
+   * bucket is deterministic (lowest sealed uncompacted), the chunk key is
+   * deterministic, and `If-None-Match: *` picks one winner among racers.
+   */
+  async function compactStream(streamId: string): Promise<CompactionResult> {
+    validateStreamId(streamId);
+
+    // Step 1: the last chunk's recorded anchor seeds the e/ LIST, so the
+    // walk covers only the uncompacted tail (and skips sub-watermark
+    // garbage, which is the sweep's business, not ours).
+    const chunks = await listAll(chunkPrefix(prefix, streamId));
+    let bucket = 0;
+    let startAfter: string | undefined;
+    if (chunks.length > 0) {
+      const last = chunks[chunks.length - 1]!;
+      bucket = baseFromKey(last.key) + chunkSize; // chunks are dense
+      const got = await driver.get(last.key);
+      if (got.kind !== "found") {
+        throw new CorruptionError(`stream ${streamId}: chunk ${last.key} vanished (chunks are immutable)`);
+      }
+      startAfter = parseChunk(got.body).lastCommitKey;
+    }
+    const tail = await listAll(commitPrefix(prefix, streamId), startAfter);
+
+    // Step 2: select bucket k only once bucket k+1 has started — the lag is
+    // structural, not clock-based; the bucket can never gain a commit.
+    const sealed = tail.some((k) => baseFromKey(k.key) >= bucket + chunkSize);
+    if (!sealed) return { status: "nothing-to-do" };
+    const members = tail.filter((k) => {
+      const base = baseFromKey(k.key);
+      return base >= bucket && base < bucket + chunkSize;
+    });
+    if (members.length === 0) {
+      // A racing winner can compact this bucket between our c/ LIST and our
+      // e/ LIST, emptying it from the listing. Its chunk proves that; only
+      // sealed-and-empty with *no* chunk is impossible (bases are dense).
+      const chunk = await driver.get(chunkKey(prefix, streamId, bucket));
+      if (chunk.kind === "found") return { status: "stood-down", chunkBase: bucket };
+      throw new CorruptionError(`stream ${streamId}: sealed bucket ${bucket} has no commits`);
+    }
+
+    // Step 3: assemble. GETs are pinned to the listing; a 404 or 412 on a
+    // source means a racing winner is already deleting (its chunk strictly
+    // precedes its deletes) — confirm the chunk and stand down.
+    const commits: CommitObject[] = [];
+    for (const member of members) {
+      const got = await driver.get(member.key, { ifMatch: member.etag });
+      if (got.kind !== "found") {
+        const chunk = await driver.get(chunkKey(prefix, streamId, bucket));
+        if (chunk.kind === "found") return { status: "stood-down", chunkBase: bucket };
+        throw new CorruptionError(`stream ${streamId}: source ${member.key} gone with no chunk`);
+      }
+      commits.push(parseCommit(got.body));
+    }
+    const chunk: ChunkObject = {
+      streamId,
+      chunkBase: bucket,
+      commits,
+      lastCommitKey: members[members.length - 1]!.key,
+    };
+    const put = await driver.putIfAbsent(chunkKey(prefix, streamId, bucket), JSON.stringify(chunk));
+
+    // Step 4: deletes strictly after the chunk exists. The 412 loser also
+    // proceeds — membership is deterministic, so the keys are identical and
+    // deletes are idempotent.
+    await driver.deleteMany(members.map((m) => m.key));
+    return put.kind === "created"
+      ? { status: "compacted", chunkBase: bucket }
+      : { status: "stood-down", chunkBase: bucket };
+  }
+
+  /**
+   * Step 5, as its own entry point: every e/ key below the watermark is
+   * garbage by definition (chunks are dense up to it). Scans from the
+   * stream start — an arbitrarily stalled writer can recreate a freed key
+   * in a bucket the watermark passed long ago.
+   */
+  async function sweepStream(streamId: string): Promise<{ deleted: number }> {
+    validateStreamId(streamId);
+    const chunks = await listAll(chunkPrefix(prefix, streamId));
+    if (chunks.length === 0) return { deleted: 0 };
+    const watermark = baseFromKey(chunks[chunks.length - 1]!.key) + chunkSize;
+    const all = await listAll(commitPrefix(prefix, streamId));
+    const garbage = all.map((k) => k.key).filter((key) => baseFromKey(key) < watermark);
+    if (garbage.length > 0) await driver.deleteMany(garbage);
+    return { deleted: garbage.length };
+  }
+
+  return { append, read, resolveHead, compactStream, sweepStream };
 }

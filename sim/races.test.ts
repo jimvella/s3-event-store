@@ -3,17 +3,17 @@
  *
  * Each test hand-scripts one of DESIGN.md's analyzed schedules using a gated
  * driver (holds a chosen call until released — the stalled writer's GC
- * pause, the reader's delayed GET) and a scripted compactor. No compaction
- * engine exists yet (roadmap phase 2); the script performs the compactor's
- * exact protocol steps: chunk PUT with If-None-Match, then source deletes.
+ * pause, the reader's delayed GET) and the real compactor
+ * (`compactStream`). Races internal to compaction itself live in
+ * compaction.test.ts.
  */
 
 import { describe, expect, it } from "vitest";
 import type { StorageDriver } from "../src/driver";
 import { ConcurrencyError, TransientStoreError } from "../src/errors";
-import { baseFromKey, chunkKey, commitPrefix } from "../src/keys";
+import { chunkKey, commitKey, commitPrefix } from "../src/keys";
 import { createEventStore, type EventStore } from "../src/store";
-import type { ChunkObject, CommitObject } from "../src/types";
+import type { CommitObject } from "../src/types";
 import { SIM_PREFIX, directDriver, gatedDriver } from "./harness";
 import { collect } from "./oracle";
 import { SimStore } from "./store";
@@ -32,38 +32,10 @@ function makeStore(driver: StorageDriver, name: string): EventStore {
   });
 }
 
-async function listAllKeys(driver: StorageDriver, prefix: string) {
-  const keys = [];
-  let after: string | undefined;
-  for (;;) {
-    const page = after !== undefined ? await driver.list(prefix, { startAfter: after }) : await driver.list(prefix);
-    keys.push(...page.keys);
-    if (page.nextStartAfter === undefined) return keys;
-    after = page.nextStartAfter;
-  }
-}
-
-/** The compactor protocol, scripted: chunk PUT strictly before deletes. */
-async function compactBucket(driver: StorageDriver, chunkBase: number): Promise<void> {
-  const listed = await listAllKeys(driver, commitPrefix(SIM_PREFIX, STREAM));
-  const members: { key: string; commit: CommitObject }[] = [];
-  for (const { key } of listed) {
-    const base = baseFromKey(key);
-    if (base < chunkBase || base >= chunkBase + CHUNK_SIZE) continue;
-    const got = await driver.get(key);
-    if (got.kind !== "found") throw new Error(`compactor: missing source ${key}`);
-    members.push({ key, commit: JSON.parse(got.body) as CommitObject });
-  }
-  if (members.length === 0) throw new Error(`compactor: empty bucket ${chunkBase}`);
-  const chunk: ChunkObject = {
-    streamId: STREAM,
-    chunkBase,
-    commits: members.map((m) => m.commit),
-    lastCommitKey: members[members.length - 1]!.key,
-  };
-  const put = await driver.putIfAbsent(chunkKey(SIM_PREFIX, STREAM, chunkBase), JSON.stringify(chunk));
-  if (put.kind !== "created") throw new Error(`compactor: chunk ${chunkBase} already exists`);
-  await driver.deleteMany(members.map((m) => m.key));
+/** Run the real compactor once; assert it compacted the expected bucket. */
+async function compact(sim: SimStore, expectedBucket: number): Promise<void> {
+  const result = await makeStore(directDriver(sim), "compactor").compactStream(STREAM);
+  expect(result).toEqual({ status: "compacted", chunkBase: expectedBucket });
 }
 
 /** One-shot gate: holds the first matching op until release() is called. */
@@ -106,8 +78,8 @@ describe("freed-key orphan (append step 4)", () => {
     await setup.append(STREAM, [{ type: "E", data: 2, id: "b2" }], { expectedVersion: 1 });
     await setup.append(STREAM, [{ type: "E", data: 3, id: "b3" }], { expectedVersion: 2 });
     await setup.append(STREAM, [{ type: "E", data: 4, id: "b4" }], { expectedVersion: 3 });
-    await compactBucket(directDriver(sim), 0);
-    await compactBucket(directDriver(sim), 2);
+    await compact(sim, 0);
+    await compact(sim, 2);
 
     // A's create-only PUT now "succeeds" at the freed key — step 4 catches it.
     gate.release();
@@ -119,6 +91,15 @@ describe("freed-key orphan (append step 4)", () => {
     expect(replay.map((e) => e.id)).toEqual(["b0", "b1", "b2", "b3", "b4"]);
     const head = await makeStore(directDriver(sim), "R2").resolveHead(STREAM);
     expect(head).toMatchObject({ kind: "head", version: 4 });
+
+    // The orphan object persists at the freed key until the sweep runs.
+    const orphanKey = commitKey(SIM_PREFIX, STREAM, 2);
+    expect(sim.dump().has(orphanKey)).toBe(true);
+    const swept = await makeStore(directDriver(sim), "S").sweepStream(STREAM);
+    expect(swept.deleted).toBe(1);
+    expect(sim.dump().has(orphanKey)).toBe(false);
+    const after = await collect(makeStore(directDriver(sim), "R3").read(STREAM));
+    expect(after.map((e) => e.id)).toEqual(["b0", "b1", "b2", "b3", "b4"]);
   });
 });
 
@@ -155,8 +136,8 @@ describe("lost response resolved through compaction (append step 3/4)", () => {
     // A's commit (base 2) is live; others build on it and it gets compacted.
     await setup.append(STREAM, [{ type: "E", data: 3, id: "b3" }], { expectedVersion: 2 });
     await setup.append(STREAM, [{ type: "E", data: 4, id: "b4" }], { expectedVersion: 3 });
-    await compactBucket(directDriver(sim), 0);
-    await compactBucket(directDriver(sim), 2);
+    await compact(sim, 0);
+    await compact(sim, 2);
 
     // The retry recreates the freed key, and step 4 finds our commitId in
     // the chunk: success, not a false ConcurrencyError.
@@ -186,8 +167,8 @@ describe("post-LIST substitution (pinned GET)", () => {
 
     // Between its LIST and its GET: the bucket seals' chunk lands, the key
     // is freed, and a stalled foreign writer recreates it.
-    await compactBucket(directDriver(sim), 0);
-    await compactBucket(directDriver(sim), 2);
+    await compact(sim, 0);
+    await compact(sim, 2);
     const forged: CommitObject = {
       commitId: "forged",
       streamId: STREAM,
@@ -234,8 +215,8 @@ describe("LIST-time orphan (sealed-bucket check)", () => {
     // Compaction runs and an orphan lands at a freed key — all *before* the
     // reader's e/ LIST, so the orphan is listed with a current etag and the
     // pinned GET alone cannot catch it.
-    await compactBucket(directDriver(sim), 0);
-    await compactBucket(directDriver(sim), 2);
+    await compact(sim, 0);
+    await compact(sim, 2);
     const orphan: CommitObject = {
       commitId: "orphan",
       streamId: STREAM,
@@ -265,8 +246,8 @@ describe("compacted-stream expectedVersion semantics", () => {
     for (let v = 0; v < 4; v++) {
       await setup.append(STREAM, [{ type: "E", data: v + 1, id: `r${v + 1}` }], { expectedVersion: v });
     }
-    await compactBucket(directDriver(sim), 0);
-    await compactBucket(directDriver(sim), 2);
+    await compact(sim, 0);
+    await compact(sim, 2);
 
     const store = makeStore(directDriver(sim), "A");
     // e/0 is a freed key: a blind create-only PUT would "succeed" and write
@@ -301,8 +282,8 @@ describe("boundary-straddling commits", () => {
     );
     await setup.append(STREAM, [{ type: "E", data: 3, id: "m3" }], { expectedVersion: 2 });
     await setup.append(STREAM, [{ type: "E", data: 4, id: "m4" }], { expectedVersion: 3 });
-    await compactBucket(directDriver(sim), 0); // commits at bases 0 and 1
-    await compactBucket(directDriver(sim), 2); // the single commit at base 3
+    await compact(sim, 0); // commits at bases 0 and 1
+    await compact(sim, 2); // the single commit at base 3
 
     const store = makeStore(directDriver(sim), "R");
     const replay = await collect(store.read(STREAM));
