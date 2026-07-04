@@ -109,6 +109,32 @@ keys to a fresh bucket) and replication is absent.
 KMS- or DynamoDB-backed stores remain possible via the interface but are not
 shipped in v1.
 
+**Key-bucket layout** — two disjoint prefixes, and the split is
+load-bearing, not taste:
+
+```
+keys/{subjectId}/{gen:06d}.json    # wrapped data key, one object per generation
+tombstones/{subjectId}.json        # shred state machine (see Shred protocol)
+```
+
+- Zero-padded generation numbers make LIST order generation order.
+  Minting generation n+1 is LIST + `If-None-Match: *` PUT at the next
+  number — racing rotations collide on the same key and one wins, the
+  same lock-free primitive as everywhere else. The envelope `keyId` is
+  the generation identifier this layout produces (opaque; `subjectId` is
+  already opaque per the no-PII rule).
+- Shred step 3's enumeration and step 4's re-list scope to
+  `keys/{subjectId}/`. The tombstone lives outside the listed prefix
+  **by construction** — it is never deleted, so if it shared the
+  generations' prefix, "re-list to confirm empty" could never be
+  satisfied and step 3 would try to delete the tombstone as a
+  generation. The layout is what makes the shred protocol's listings
+  well-defined.
+- The prefixes are also the IAM boundary: minters and rotation hold
+  `PutObject`/`GetObject` on `keys/*` only; the shred initiator writes
+  `tombstones/*`; `DeleteObject` on `keys/*` belongs to the sweeper's
+  principal alone (see the confinement note under Shred protocol).
+
 ## Key rotation
 
 Immutability constrains rotation sharply, so name the operations precisely —
@@ -172,7 +198,20 @@ Rules for the audit stream:
 2. **Opaque subject identifiers only.** Proof-of-erasure records are lawful to
    retain (Article 17(3) legal-obligation carve-out) — but only if the subject
    reference is an opaque ID. A PII-bearing audit record would itself need
-   shredding, recording which… is a circle.
+   shredding, recording which… is a circle. And "opaque" must be argued
+   precisely: while the application holds a subjectId↔person mapping, the
+   ID is *pseudonymous*, not anonymous — still personal data under GDPR
+   (Recital 26). The retained subject→keyId linkage is lawful in two
+   steps: (a) **the application must delete its own subjectId↔person
+   mapping in the same erasure workflow** — a second application
+   contract, same register as the erasure-completeness rule (see Erasure:
+   crypto-shredding), and like it unenforceable by the library; after
+   mapping deletion the audit record links an opaque number to destroyed
+   keyIds and identifies no one — genuinely anonymous, outside GDPR
+   scope. (b) In the window before mapping deletion, retaining the
+   minimal record (opaque ID, keyIds, timestamps, actor — no attributes)
+   is what the Article 17(3)(b) carve-out covers, with data minimization
+   as the discipline.
 3. **Plaintext payloads.** No PII → nothing to shred → no dependency on the
    key store it is auditing.
 4. **Reserved name.** `$system.key-audit` sits in the `$`-reserved stream
@@ -223,37 +262,61 @@ exists to close. A tombstone object, once created, is never deleted.
    delete**: the point of irrecoverability, where Article 17 is
    satisfied. A `committing` tombstone is never transitioned again — it
    is the permanent never-re-key signal, mechanism included.
-   Hard-delete rights on the key bucket can be confined to the
-   sweeper's principal — one identity destroys long-lived keys, and it
-   only acts on an expired, audited intent it has visibly committed.
-4. Re-list to confirm empty — if a crashed minter's stray landed
+   `DeleteObject` on `keys/*` is confined to the sweeper's principal
+   **alone** — minters hold none, and a failed mint has no delete step
+   (see the minting rule below) — so exactly one identity destroys
+   long-lived keys, and it only acts on an expired, audited intent it
+   has visibly committed.
+4. Re-list to confirm empty — if a stalled minter's stray landed
    mid-shred the re-list is non-empty: delete it and re-list again
-   (terminates, because post-tombstone mints self-delete: the sweep
-   runs entirely inside `committing`, a state with no outbound
-   transition, so every mint's re-check during it must observe the
-   tombstone) — then append `ShredCompleted`.
+   (terminates: a mint whose pre-check runs after the tombstone is
+   durable never PUTs, so only the finite set of mints in flight at
+   tombstone creation can land strays, each cleared once) — then
+   append `ShredCompleted`. A pathologically stalled mint landing
+   *after* `ShredCompleted` leaves an inert object — no ciphertext
+   ever exists under it and keyring reads never deliver it (see the
+   minting and keyring rules below) — swept as hygiene later.
 
 Three rules make the tombstone airtight rather than advisory:
 
 - **Minting pairs with it check → write → re-check** (the same shape as
   append's step-4 chunk verification): read the tombstone (must be
   absent or `cancelled`), `PUT` the generation (`If-None-Match: *`),
-  read the tombstone again — if a soft-deleted state appeared, delete
-  the just-minted generation and fail the mint. A mint whose PUT landed
-  before step 3's enumeration is deleted by it; one that landed after
-  is self-deleting, because the tombstone was durable before
-  enumeration began and the re-check must observe it. And the re-check
-  cannot be fooled by a concurrent cancellation: a sweep runs entirely
-  inside `committing`, which has no outbound transition — the CAS at
-  the commit point already decided that race before the first
+  read the tombstone again — if a soft-deleted state appeared, **fail
+  the mint** with a typed error. Deliberately no delete step: minters
+  hold no `DeleteObject` (see Key-bucket layout) — that abstinence is
+  what makes the one-deleting-principal claim in step 3 strict rather
+  than aspirational. The stray a failed mint leaves is inert: the
+  re-check precedes any encryption, so no ciphertext ever exists under
+  it, and keyring reads never deliver it (next rule); step 4's re-list
+  or a later sweep removes it. A mint whose PUT landed before step 3's
+  enumeration is deleted by it; one that landed after is caught by the
+  re-list, because the tombstone was durable before enumeration began
+  and the pre-check of any *newer* mint must observe it. And the
+  re-check cannot be fooled by a concurrent cancellation: a sweep runs
+  entirely inside `committing`, which has no outbound transition — the
+  CAS at the commit point already decided that race before the first
   generation was destroyed.
 - **Keyring reads treat the tombstone as authoritative.** The `KeyStore`
   read path and the key-delivery endpoint return an empty keyring for a
-  soft-deleted subject, whatever objects a crashed minter left behind. A
-  stray generation (crash between PUT and re-check) is therefore inert —
-  it decrypts nothing pre-shred (generations only move forward) and is
-  never delivered — and gets deleted as hygiene whenever a sweep next
-  observes it.
+  soft-deleted subject, whatever objects a crashed or failed minter left
+  behind. A stray generation (crash between PUT and re-check, or a
+  failed re-check) is therefore inert — it decrypts nothing pre-shred
+  (generations only move forward) and is never delivered — and gets
+  deleted as hygiene whenever a sweep next observes it, **but only
+  under a soft-deleted tombstone** (`pending`/`committing`): under
+  `cancelled` a stray is indistinguishable from a real generation, and
+  deleting it would itself be erasure. Accepted residual: a stray
+  minted during a shred that is later cancelled becomes a permanent
+  unused generation — unaudited, never used to encrypt, keyring noise
+  only. (Having the failed mint delete its own stray would merely narrow
+  this window — a crash between re-check and delete mints the same
+  orphan — while handing every minter `DeleteObject`; that trade is why
+  the mint has no delete step.) Read-path tombstone staleness —
+  including a cached "no tombstone" — needs no separate bound: a stale
+  *live* verdict is exactly as stale as a cached keyring, which the
+  unreadability budget already covers, so it shares the key-cache TTL.
+  Only the write side needs the shorter leash (next rule).
 - **Appends consult the tombstone before encrypting.** The append
   path's key lookup goes through the same tombstone-authoritative read
   path — a cached *unwrapped key* may live out its documented TTL, but
@@ -320,6 +383,17 @@ plaintext) is the v1 choice:
   tags). Random nonces bound safe use to ~2³² encryptions per key (NIST
   collision margin); treat that ceiling as an input to rotation cadence —
   mint a new generation long before any key approaches it.
+- **Length sits outside the encryption boundary.** Compress-before-encrypt
+  makes ciphertext length ≈ compressed plaintext length, so payload size
+  and compressibility leak through object sizes and page bytes to anything
+  that can LIST the bucket or observe caches. Accepted for stored business
+  events: the CRIME/BREACH amplifier needs attacker-controlled input
+  compressed adjacent to a secret in the *same* payload, with many
+  observable tries — a shape only the application can build, so warn in
+  docs (don't mix attacker-supplied data and secrets in one encrypted
+  payload) rather than mitigate in the library. Escape hatch if it ever
+  matters: pad plaintext to fixed-size buckets before encrypting — a
+  serializer option, not v1.
 - Cost: payloads are opaque to the S3 console, grep, Athena/S3 Select — all
   debugging goes through the library.
 
@@ -371,7 +445,9 @@ Two clocks, two budgets:
 
 - **Unreadability** (starts at the tombstone): delay = the **maximum of
   all plaintext- and key-cache TTLs** — worker key caches, edge plaintext
-  TTLs (model A), client-delivered keyring TTLs (model B). One documented
+  TTLs (model A), client-delivered keyring TTLs (model B). Read-path
+  tombstone staleness shares these TTLs and needs no line of its own
+  (see the keyring rule under Shred protocol). One documented
   number. DESIGN.md's contract obliges every cache the core and
   deployment introduce to declare a bounded TTL; this budget is where
   they land. The **write side** has its own, shorter line in the same
