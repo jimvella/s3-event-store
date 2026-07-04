@@ -21,6 +21,13 @@ export interface EventEnvelope {
   type: string;
   version: number;
   data: unknown;
+  /**
+   * Reserved field (DESIGN.md, Encryption & erasure contract): opaque key
+   * generation identifier — plaintext, outside the encryption boundary,
+   * inside the envelope compaction copies verbatim. Absent on unencrypted
+   * events.
+   */
+  keyId?: string;
   meta: EventMeta;
 }
 

@@ -12,7 +12,10 @@
 import {
   DeleteObjectCommand,
   DeleteObjectsCommand,
+  GetBucketReplicationCommand,
+  GetBucketVersioningCommand,
   GetObjectCommand,
+  GetObjectLockConfigurationCommand,
   ListObjectsV2Command,
   PutObjectCommand,
 } from "@aws-sdk/client-s3";
@@ -63,6 +66,53 @@ function is404(err: unknown): boolean {
 
 function is412(err: unknown): boolean {
   return status(err) === 412 || errName(err) === "PreconditionFailed";
+}
+
+/**
+ * Startup verification for the KEY bucket's inverted configuration
+ * (KEYS_DESIGN.md, "Key store as a separate S3 bucket"): fail fast unless
+ * versioning is in the never-enabled empty state (`Suspended` fails too —
+ * suspended buckets retain every prior version, and a bucket cannot be
+ * un-versioned; remediation is migrating keys to a fresh bucket),
+ * replication is absent, and Object Lock is not configured.
+ *
+ * Requires GetBucketVersioning / GetBucketReplication /
+ * GetObjectLockConfiguration permissions — grant to the startup principal
+ * only. Not applicable to R2 (no such APIs); R2 buckets are unversioned
+ * and unreplicated by construction.
+ */
+export async function verifyKeyBucketConfig(client: S3ClientLike, bucket: string): Promise<void> {
+  const versioning = (await client.send(new GetBucketVersioningCommand({ Bucket: bucket }))) as {
+    Status?: string;
+  };
+  if (versioning.Status !== undefined) {
+    throw new Error(
+      `key bucket ${bucket}: versioning is ${versioning.Status} — must be never-enabled; ` +
+        `a versioned delete is only a delete marker (migrate keys to a fresh bucket)`,
+    );
+  }
+  let replicated = false;
+  try {
+    await client.send(new GetBucketReplicationCommand({ Bucket: bucket }));
+    replicated = true;
+  } catch (err) {
+    if (errName(err) !== "ReplicationConfigurationNotFoundError" && status(err) !== 404) throw err;
+  }
+  if (replicated) {
+    throw new Error(
+      `key bucket ${bucket}: replication configured — replicas silently retain shredded keys`,
+    );
+  }
+  let locked = false;
+  try {
+    await client.send(new GetObjectLockConfigurationCommand({ Bucket: bucket }));
+    locked = true;
+  } catch (err) {
+    if (errName(err) !== "ObjectLockConfigurationNotFoundError" && status(err) !== 404) throw err;
+  }
+  if (locked) {
+    throw new Error(`key bucket ${bucket}: Object Lock configured — erasure requires delete`);
+  }
 }
 
 export function awsSdkDriver(opts: AwsSdkDriverOptions): StorageDriver {

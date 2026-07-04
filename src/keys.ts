@@ -16,12 +16,14 @@ export function padVersion(v: number): string {
   return String(v).padStart(PAD, "0");
 }
 
-export function validateStreamId(streamId: string): void {
+export function validateStreamId(streamId: string, opts?: { allowReserved?: boolean }): void {
   if (streamId.length === 0) throw new RangeError("streamId must be non-empty");
   if (streamId.includes("/")) {
     throw new RangeError(`streamId must not contain "/": ${streamId}`);
   }
-  if (streamId.startsWith("$")) {
+  if (streamId.startsWith("$") && opts?.allowReserved !== true) {
+    // Reserved for library-defined system streams ($system.key-audit),
+    // appended only by library-internal writers (DESIGN.md, Core mechanism).
     throw new RangeError(`stream IDs beginning with "$" are reserved: ${streamId}`);
   }
 }

@@ -233,10 +233,18 @@ erasure are specified in [KEYS_DESIGN.md](KEYS_DESIGN.md).
 
 Pre-release. Implemented so far (`src/`): the core append/read protocol,
 head discovery with `head.json` hints and the in-process head cache,
-compaction (`compactStream` + sweep) with the write-driven trigger, and the
+compaction (`compactStream` + sweep) with the write-driven trigger, the
 three storage drivers (`aws-sdk`, `r2-binding`, `aws4fetch`) with a shared
 conformance suite (fake backends always; real endpoints via
-`S3EV_CONFORMANCE_*` env vars). The deterministic simulation harness
+`conformance.local.json`), and the encryption layer per
+[KEYS_DESIGN.md](KEYS_DESIGN.md): AES-256-GCM whole-payload encrypting
+serializer (compress-then-encrypt, random nonces, `keyId` envelopes), the
+`KeyStore` interface with the S3-key-bucket implementation (wrapped keys,
+generational rotation, tombstone-authoritative reads, TTL-bounded caches,
+startup config verification), and the crypto-shredding workflow
+(`requestShred`/`cancelShred`/`sweepShreds`: intent-first audit trail on
+`$system.key-audit`, tombstone CAS state machine, soft-delete waiting
+period, sweeper-executed hard delete). The deterministic simulation harness
 (`sim/`; see [SIMULATOR_PLAN.md](SIMULATOR_PLAN.md)) checks the full
 invariant set, including no-forged-heads and every-committed-event-readable
 after every mutation. Still ahead per [DESIGN.md](DESIGN.md#roadmap):

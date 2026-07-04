@@ -41,3 +41,27 @@ export class SerializationError extends Error {
     this.name = "SerializationError";
   }
 }
+
+/**
+ * The subject has a soft-deleted (pending/committing) shred tombstone:
+ * appends must stop writing its personal data, key delivery returns empty
+ * (KEYS_DESIGN.md, Shred protocol). Raised before any PUT.
+ */
+export class SubjectErasedError extends Error {
+  constructor(public readonly subjectId: string) {
+    super(`subject ${subjectId} is erased or being erased; refusing to encrypt`);
+    this.name = "SubjectErasedError";
+  }
+}
+
+/**
+ * Fail-closed decryption failure: the key is shredded, undeliverable, or
+ * the ciphertext fails authentication. A shredded stream presents as this,
+ * never as stale plaintext.
+ */
+export class ShreddedDataError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ShreddedDataError";
+  }
+}

@@ -7,6 +7,7 @@
 
 import type { StorageDriver, ListedKey } from "./driver.js";
 import { ConcurrencyError, CorruptionError, TransientStoreError } from "./errors.js";
+import { jsonSerializer, type PayloadSerializer } from "./serializer.js";
 import {
   baseFromKey,
   bucketBase,
@@ -42,10 +43,20 @@ export interface EventStoreConfig {
   clock?: () => string;
   /** Bounded retries for transient driver failures and `"any"` conflicts. */
   maxRetries?: number;
+  /** Payload serializer (the encryption seam). Default: plain JSON. */
+  serializer?: PayloadSerializer;
+  /**
+   * Permit `$`-prefixed stream IDs — library-internal writers only
+   * ($system.key-audit). The external surface must keep rejecting them.
+   */
+  allowReservedStreams?: boolean;
 }
 
 export interface ReadOptions {
   fromVersion?: number;
+  /** Skip deserialization: yield stored payloads (ciphertext) verbatim —
+   * the model-B egress path. Default false (plaintext out). */
+  raw?: boolean;
 }
 
 export interface AppendOptions {
@@ -89,6 +100,8 @@ export function createEventStore(config: EventStoreConfig): EventStore {
   const ids = config.ids ?? (() => globalThis.crypto.randomUUID());
   const clock = config.clock ?? (() => new Date().toISOString());
   const maxRetries = config.maxRetries ?? 5;
+  const serializer = config.serializer ?? jsonSerializer();
+  const idOpts = { allowReserved: config.allowReservedStreams === true };
 
   /** Drain a paginated LIST; each page is a separate driver call. */
   async function listAll(pfx: string, startAfter?: string): Promise<ListedKey[]> {
@@ -247,7 +260,7 @@ export function createEventStore(config: EventStoreConfig): EventStore {
   }
 
   async function resolveHead(streamId: string): Promise<HeadResolution> {
-    validateStreamId(streamId);
+    validateStreamId(streamId, idOpts);
     return (await resolveHeadInternal(streamId)).head;
   }
 
@@ -291,10 +304,15 @@ export function createEventStore(config: EventStoreConfig): EventStore {
     return chunk.commits.some((c) => c.commitId === commitId) ? "ours" : "foreign";
   }
 
+  /** EventInput with its payload already through the serializer. */
+  interface PreparedEvent extends EventInput {
+    keyId?: string;
+  }
+
   async function appendAt(
     streamId: string,
     baseVersion: number,
-    events: EventInput[],
+    events: PreparedEvent[],
     watermark: number,
   ): Promise<AppendResult> {
     const committedAt = clock();
@@ -307,6 +325,7 @@ export function createEventStore(config: EventStoreConfig): EventStore {
         type: e.type,
         version: baseVersion + i,
         data: e.data,
+        ...(e.keyId !== undefined ? { keyId: e.keyId } : {}),
         meta: { ...e.meta, ts: e.meta?.ts ?? committedAt },
       })),
       committedAt,
@@ -393,7 +412,7 @@ export function createEventStore(config: EventStoreConfig): EventStore {
     events: EventInput[],
     opts: AppendOptions,
   ): Promise<AppendResult> {
-    validateStreamId(streamId);
+    validateStreamId(streamId, idOpts);
     if (events.length === 0) throw new RangeError("append requires at least one event");
     if (events.length > chunkSize) {
       throw new RangeError(`a commit holds at most ${chunkSize} events (got ${events.length})`);
@@ -402,6 +421,16 @@ export function createEventStore(config: EventStoreConfig): EventStore {
     if (typeof expected === "number" && (!Number.isInteger(expected) || expected < 0)) {
       // -1 is rejected rather than aliased: first append is "noStream".
       throw new RangeError(`expectedVersion must be >= 0, "any", or "noStream" (got ${expected})`);
+    }
+
+    // Serialize once, before any retry loop: a retried conditional PUT
+    // must carry byte-identical content (the commitId self-check depends
+    // on it), and the encrypting serializer's tombstone consult fails a
+    // doomed append here, before any PUT (SubjectErasedError).
+    const prepared: PreparedEvent[] = [];
+    for (const e of events) {
+      const s = await serializer.serialize(streamId, { type: e.type, data: e.data });
+      prepared.push({ ...e, data: s.data, ...(s.keyId !== undefined ? { keyId: s.keyId } : {}) });
     }
 
     const attempts = expected === "any" ? maxRetries : 1;
@@ -444,7 +473,7 @@ export function createEventStore(config: EventStoreConfig): EventStore {
       }
       const base = head.kind === "noStream" ? 0 : head.version + 1;
       try {
-        return await appendAt(streamId, base, events, state.watermark);
+        return await appendAt(streamId, base, prepared, state.watermark);
       } catch (err) {
         if (err instanceof ConcurrencyError && expected === "any") {
           lastConflict = err;
@@ -463,7 +492,7 @@ export function createEventStore(config: EventStoreConfig): EventStore {
    * since our LIST" — re-LIST c/ and fill the gap from the new chunk.
    */
   async function* read(streamId: string, opts?: ReadOptions): AsyncGenerator<EventEnvelope> {
-    validateStreamId(streamId);
+    validateStreamId(streamId, idOpts);
     const fromVersion = opts?.fromVersion ?? 0;
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
@@ -473,7 +502,13 @@ export function createEventStore(config: EventStoreConfig): EventStore {
       // the consumer (never yield, fail, and re-yield). Streaming with
       // mid-iteration recovery is a later optimization.
       if (ok) {
-        yield* yielded;
+        if (opts?.raw === true) {
+          yield* yielded;
+        } else {
+          for (const envelope of yielded) {
+            yield { ...envelope, data: await serializer.deserialize(streamId, envelope) };
+          }
+        }
         return;
       }
     }
@@ -555,7 +590,7 @@ export function createEventStore(config: EventStoreConfig): EventStore {
    * deterministic, and `If-None-Match: *` picks one winner among racers.
    */
   async function compactStream(streamId: string): Promise<CompactionResult> {
-    validateStreamId(streamId);
+    validateStreamId(streamId, idOpts);
 
     // Step 1: the last chunk's recorded anchor seeds the e/ LIST, so the
     // walk covers only the uncompacted tail (and skips sub-watermark
@@ -656,7 +691,7 @@ export function createEventStore(config: EventStoreConfig): EventStore {
    * in a bucket the watermark passed long ago.
    */
   async function sweepStream(streamId: string): Promise<{ deleted: number }> {
-    validateStreamId(streamId);
+    validateStreamId(streamId, idOpts);
     const chunks = await listAll(chunkPrefix(prefix, streamId));
     if (chunks.length === 0) return { deleted: 0 };
     const watermark = baseFromKey(chunks[chunks.length - 1]!.key) + chunkSize;
