@@ -1,2 +1,4 @@
 node_modules/
 dist/
+# real-backend conformance credentials — never commit
+conformance.local.json

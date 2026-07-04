@@ -240,5 +240,48 @@ conformance suite (fake backends always; real endpoints via
 (`sim/`; see [SIMULATOR_PLAN.md](SIMULATOR_PLAN.md)) checks the full
 invariant set, including no-forged-heads and every-committed-event-readable
 after every mutation. Still ahead per [DESIGN.md](DESIGN.md#roadmap):
-package/build plumbing, CI, encryption (KEYS_DESIGN.md), the browser
-client.
+package/build plumbing, encryption (KEYS_DESIGN.md), the browser client,
+MinIO/testcontainers conformance (deferred — real S3 and R2 are covered by
+the env-gated run below), and an in-Workers conformance run for the
+r2-binding driver's `onlyIf` semantics.
+
+### Testing
+
+- `npm test` — the full deterministic suite: pinned regression seed
+  ranges, scripted race scenarios, driver conformance against in-memory
+  fakes. No network, no credentials.
+- `npm run sweep [-- <count> [<startSeed>]]` — manual randomized
+  exploration (default 2000 seeds; ~10k seeds ≈ 17 s). Prints a
+  `reproduce with:` line; on failure, rerun the named seed, then distill
+  the schedule into a scripted regression.
+- **Real-backend conformance** (S3, R2, MinIO, …): the same conformance
+  suite the fakes pass runs against live endpoints configured in a
+  gitignored `conformance.local.json` at the repo root — one target
+  object, or an array to test several providers in one run:
+
+  ```json
+  [
+    {
+      "endpoint": "https://s3.us-east-1.amazonaws.com",
+      "bucket": "s3-eventsourcing-test",
+      "region": "us-east-1",
+      "accessKey": "AKIA…",
+      "secretKey": "…"
+    },
+    {
+      "endpoint": "https://<account-id>.r2.cloudflarestorage.com",
+      "bucket": "s3ev-conformance",
+      "region": "auto",
+      "accessKey": "…",
+      "secretKey": "…"
+    }
+  ]
+  ```
+
+  Then: `npx vitest run sim/conformance.test.ts`. (The
+  `S3EV_CONFORMANCE_*` environment variables still work as an
+  alternative/override for one-off runs.) Use dedicated buckets, never
+  production ones, with credentials scoped to that bucket only. Each run
+  writes ~30 small objects under a fresh `conf-<timestamp>/` prefix; add a
+  lifecycle rule expiring the `conf-` prefix after a day to keep the
+  bucket clean.
