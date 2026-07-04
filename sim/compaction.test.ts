@@ -11,7 +11,7 @@ import { ConcurrencyError, TransientStoreError } from "../src/errors";
 import { chunkKey, chunkPrefix, commitKey } from "../src/keys";
 import { createEventStore, type EventStore } from "../src/store";
 import { SIM_PREFIX, directDriver, gatedDriver, runSim } from "./harness";
-import { Oracle, collect } from "./oracle";
+import { Oracle, collect, resolveHeadChecked, storageInvariant } from "./oracle";
 import { SimStore } from "./store";
 
 const CHUNK_SIZE = 2;
@@ -181,6 +181,7 @@ describe("randomized write-triggered compaction sweep", () => {
           },
         },
         (ctx) => {
+          ctx.afterEveryOp(storageInvariant(ctx.simStore, oracle, CHUNK_SIZE));
           for (let a = 0; a < 2; a++) {
             const rng = ctx.rng.fork();
             ctx.spawn(`appender${a}`, async (store) => {
@@ -190,15 +191,15 @@ describe("randomized write-triggered compaction sweep", () => {
                 try {
                   let expected: number | "any" | "noStream" = "any";
                   if (rng.int(2) === 0) {
-                    const head = await store.resolveHead(STREAM);
+                    const head = await resolveHeadChecked(oracle, store, STREAM);
                     expected = head.kind === "noStream" ? "noStream" : head.version;
                   }
-                  await store.append(STREAM, [{ type: "E", data: i, id }], {
+                  const r = await store.append(STREAM, [{ type: "E", data: i, id }], {
                     expectedVersion: expected,
                   });
-                  oracle.resolve(token, "committed");
+                  oracle.resolve(token, "committed", r.nextExpectedVersion);
                   // Write-triggered compaction, fired from the write path.
-                  await store.compactStream(STREAM);
+                  if (r.compactionSuggested) await store.compactStream(STREAM);
                 } catch (err) {
                   if (err instanceof ConcurrencyError) oracle.resolve(token, "rejected");
                   else if (err instanceof TransientStoreError) oracle.resolve(token, "indefinite");

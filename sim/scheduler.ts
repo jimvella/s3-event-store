@@ -50,6 +50,12 @@ export class Scheduler {
   readonly trace: TraceEntry[] = [];
   private step = 0;
   private opRng: Rng;
+  private afterOp: (() => void) | undefined;
+
+  /** Hook run after every applied op — continuous invariant checking. */
+  setAfterOp(fn: () => void): void {
+    this.afterOp = fn;
+  }
 
   constructor(
     private rng: Rng,
@@ -144,6 +150,16 @@ export class Scheduler {
       const item = this.queue.splice(this.rng.int(this.queue.length), 1)[0]!;
       this.step++;
       item.run();
+      if (this.afterOp) {
+        try {
+          this.afterOp();
+        } catch (error) {
+          throw new Error(
+            `invariant violated after step ${this.step} (${item.actor}: ${item.label}): ${String(error)}`,
+            { cause: error },
+          );
+        }
+      }
     }
     if (this.actorFailures.length > 0) {
       const first = this.actorFailures[0]!;

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ConcurrencyError, TransientStoreError } from "../src/errors";
 import { runSim, type SimContext } from "./harness";
-import { Oracle, collect } from "./oracle";
+import { Oracle, collect, resolveHeadChecked, storageInvariant } from "./oracle";
 import type { FaultPlan } from "./scheduler";
 
 describe("smoke", () => {
@@ -54,9 +54,17 @@ describe("smoke", () => {
   });
 });
 
-/** Randomized concurrent workload; oracle-verified. */
-function mixScenario(oracle: Oracle, streams: string[], appenders: number, opsEach: number) {
+/** Randomized concurrent workload; oracle-verified, both invariants live. */
+function mixScenario(
+  oracle: Oracle,
+  streams: string[],
+  appenders: number,
+  opsEach: number,
+  chunkSize = 4, // must match runSim's default
+) {
   return (ctx: SimContext) => {
+    // Invariant 5: every committed event readable, after every mutation.
+    ctx.afterEveryOp(storageInvariant(ctx.simStore, oracle, chunkSize));
     for (let a = 0; a < appenders; a++) {
       const rng = ctx.rng.fork();
       const name = `appender${a}`;
@@ -70,11 +78,12 @@ function mixScenario(oracle: Oracle, streams: string[], appenders: number, opsEa
             const useAny = rng.int(2) === 0;
             let expected: number | "any" | "noStream" = "any";
             if (!useAny) {
-              const head = await store.resolveHead(streamId);
+              // Invariant 4: every resolution lands inside the oracle bounds.
+              const head = await resolveHeadChecked(oracle, store, streamId);
               expected = head.kind === "noStream" ? "noStream" : head.version;
             }
-            await store.append(streamId, events, { expectedVersion: expected });
-            oracle.resolve(token, "committed");
+            const r = await store.append(streamId, events, { expectedVersion: expected });
+            oracle.resolve(token, "committed", r.nextExpectedVersion);
           } catch (err) {
             if (err instanceof ConcurrencyError) oracle.resolve(token, "rejected");
             else if (err instanceof TransientStoreError) oracle.resolve(token, "indefinite");
@@ -85,8 +94,12 @@ function mixScenario(oracle: Oracle, streams: string[], appenders: number, opsEa
     }
     ctx.spawn("reader", async (store) => {
       // Concurrent reads: store.read verifies contiguity internally; any
-      // violation fails the actor and thus the simulation.
-      for (const streamId of streams) await collect(store.read(streamId));
+      // violation fails the actor and thus the simulation. Each read is
+      // preceded by a bounds-checked head resolution (invariant 4).
+      for (const streamId of streams) {
+        await resolveHeadChecked(oracle, store, streamId);
+        await collect(store.read(streamId));
+      }
     });
   };
 }

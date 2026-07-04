@@ -231,9 +231,14 @@ erasure are specified in [KEYS_DESIGN.md](KEYS_DESIGN.md).
 
 ## Status
 
-Pre-release. Implemented so far: the core append/read protocol, compaction
-(`compactStream` + sweep) (`src/`), and the deterministic simulation
-harness (`sim/` — seeded scheduler, in-memory S3 model, oracle, named-race
-regression scenarios; see [SIMULATOR_PLAN.md](SIMULATOR_PLAN.md)). Still
-ahead per [DESIGN.md](DESIGN.md#roadmap): drivers for real backends, head
-hints and caching, encryption, the browser client.
+Pre-release. Implemented so far (`src/`): the core append/read protocol,
+head discovery with `head.json` hints and the in-process head cache,
+compaction (`compactStream` + sweep) with the write-driven trigger, and the
+three storage drivers (`aws-sdk`, `r2-binding`, `aws4fetch`) with a shared
+conformance suite (fake backends always; real endpoints via
+`S3EV_CONFORMANCE_*` env vars). The deterministic simulation harness
+(`sim/`; see [SIMULATOR_PLAN.md](SIMULATOR_PLAN.md)) checks the full
+invariant set, including no-forged-heads and every-committed-event-readable
+after every mutation. Still ahead per [DESIGN.md](DESIGN.md#roadmap):
+package/build plumbing, CI, encryption (KEYS_DESIGN.md), the browser
+client.

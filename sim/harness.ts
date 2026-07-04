@@ -24,6 +24,8 @@ export interface SimContext {
   scheduler: Scheduler;
   /** Spawn an actor with its own driver-bound event store. */
   spawn(name: string, fn: (store: EventStore, driver: StorageDriver) => Promise<void>): void;
+  /** Run a check after every applied op (the continuous storage invariant). */
+  afterEveryOp(fn: () => void): void;
 }
 
 export interface SimResult {
@@ -62,6 +64,9 @@ export async function runSim(
         clock: () => scheduler.now(),
       });
       scheduler.spawn(name, () => fn(store, driver));
+    },
+    afterEveryOp(fn) {
+      scheduler.setAfterOp(fn);
     },
   };
 

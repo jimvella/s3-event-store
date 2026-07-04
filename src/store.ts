@@ -1,8 +1,8 @@
 /**
- * The event store: append protocol steps 1-4 and the chunk-aware read path
- * (DESIGN.md, "Core mechanism"). Phase-1 scope: cold-path head resolution
- * only (head.json hints and the in-process head cache are roadmap phase 2;
- * nothing here writes head.json yet).
+ * The event store: the append protocol (steps 1-5), head discovery (fast
+ * path via the head.json hint, cold path via chunk-seeded LISTs, in-process
+ * head cache), the chunk-aware read path, and compaction
+ * (DESIGN.md, "Core mechanism" / "Compaction protocol").
  */
 
 import type { StorageDriver, ListedKey } from "./driver.js";
@@ -14,6 +14,7 @@ import {
   chunkPrefix,
   commitKey,
   commitPrefix,
+  headKey,
   validateStreamId,
 } from "./keys.js";
 import type {
@@ -23,6 +24,7 @@ import type {
   EventEnvelope,
   EventInput,
   ExpectedVersion,
+  HeadHint,
 } from "./types.js";
 
 export interface EventStoreConfig {
@@ -109,23 +111,119 @@ export function createEventStore(config: EventStoreConfig): EventStore {
   }
 
   /**
-   * Cold-path head resolution (DESIGN.md, "Head discovery"). Every anchor
-   * GET is pinned to the ETag its LIST reported; a 412/404 means the anchor
-   * was replaced or compacted after the LIST — re-resolve.
+   * In-process head cache (DESIGN.md, Cost & performance): a hint that
+   * skips resolution, sound only because of the step-4 chunk check. A 412
+   * or a step-4 ConcurrencyError invalidates it; stale-high cannot arise
+   * within the protocol (the process only caches heads it observed).
    */
-  async function resolveHead(streamId: string): Promise<HeadResolution> {
+  interface CachedHead {
+    version: number;
+    lastCommitKey: string;
+    lastCommitEtag: string;
+    /** Last-known compaction watermark — feeds the trigger arithmetic. */
+    compactedTo: number;
+  }
+  const headCache = new Map<string, CachedHead>();
+
+  interface ResolvedState {
+    head: HeadResolution;
+    watermark: number;
+  }
+
+  /** Full resolution: fast path via the hint, cold path as fallback. */
+  async function resolveHeadInternal(streamId: string): Promise<ResolvedState> {
+    const hintGot = await driver.get(headKey(prefix, streamId));
+    if (hintGot.kind === "found") {
+      const hint = JSON.parse(hintGot.body) as HeadHint;
+      if (hint.lastCommitKey !== null && hint.lastCommitEtag !== null) {
+        const fast = await resolveFast(streamId, hint.lastCommitKey, hint.lastCommitEtag);
+        if (fast !== null) {
+          const state = { head: fast, watermark: hint.compactedTo ?? 0 };
+          cacheState(streamId, state);
+          return state;
+        }
+        // Every hint corruption falls safe to the cold path, never corrupt.
+      }
+    }
+    const state = await resolveCold(streamId);
+    cacheState(streamId, state);
+    return state;
+  }
+
+  function cacheState(streamId: string, state: ResolvedState): void {
+    if (state.head.kind === "head") {
+      headCache.set(streamId, {
+        version: state.head.version,
+        lastCommitKey: state.head.lastCommitKey,
+        lastCommitEtag: state.head.lastCommitEtag,
+        compactedTo: state.watermark,
+      });
+    } else {
+      headCache.delete(streamId);
+    }
+  }
+
+  /**
+   * Fast path (DESIGN.md, Head discovery): LIST strictly after the hint's
+   * key — the key, not a version the hint asserts. If the LIST returns
+   * keys, the newest anchors the head (pinned to its listed ETag). If it
+   * returns nothing, the hint is the only evidence: GET `lastCommitKey`
+   * pinned to `lastCommitEtag` and derive the head from the body —
+   * existence alone is not corroboration. Returns null to fall cold.
+   */
+  async function resolveFast(
+    streamId: string,
+    lastCommitKey: string,
+    lastCommitEtag: string,
+  ): Promise<HeadResolution | null> {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      const tail = await listAll(commitPrefix(prefix, streamId), lastCommitKey);
+      if (tail.length > 0) {
+        const anchor = tail[tail.length - 1]!;
+        const got = await driver.get(anchor.key, { ifMatch: anchor.etag });
+        if (got.kind !== "found") continue; // anchor replaced/compacted; re-list
+        const commit = parseCommit(got.body);
+        return {
+          kind: "head",
+          version: commit.baseVersion + commit.events.length - 1,
+          lastCommitKey: anchor.key,
+          lastCommitEtag: got.etag,
+        };
+      }
+      const got = await driver.get(lastCommitKey, { ifMatch: lastCommitEtag });
+      if (got.kind !== "found") return null; // hint invalidated → cold path
+      const commit = parseCommit(got.body);
+      return {
+        kind: "head",
+        version: commit.baseVersion + commit.events.length - 1,
+        lastCommitKey,
+        lastCommitEtag: got.etag,
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Cold path (DESIGN.md, "Head discovery"): the last chunk's recorded
+   * anchor seeds the e/ LIST. Every anchor GET is pinned to the ETag its
+   * LIST reported; a 412/404 means the anchor was replaced or compacted
+   * after the LIST — re-resolve.
+   */
+  async function resolveCold(streamId: string): Promise<ResolvedState> {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       const chunks = await listAll(chunkPrefix(prefix, streamId));
       let startAfter: string | undefined;
+      let watermark = 0;
       if (chunks.length > 0) {
         const last = chunks[chunks.length - 1]!;
+        watermark = baseFromKey(last.key) + chunkSize;
         const got = await driver.get(last.key, { ifMatch: last.etag });
         if (got.kind !== "found") continue; // chunk replaced under us; re-resolve
         startAfter = parseChunk(got.body).lastCommitKey;
       }
       const tail = await listAll(commitPrefix(prefix, streamId), startAfter);
       if (tail.length === 0) {
-        if (chunks.length === 0) return { kind: "noStream" };
+        if (chunks.length === 0) return { head: { kind: "noStream" }, watermark: 0 };
         // A non-empty stream always has commits under e/ — the highest
         // occupied bucket can never seal (DESIGN.md, Head discovery).
         throw new CorruptionError(`stream ${streamId}: chunks exist but e/ tail is empty`);
@@ -136,13 +234,33 @@ export function createEventStore(config: EventStoreConfig): EventStore {
       const commit = parseCommit(got.body);
       // Version math from the body, never key arithmetic.
       return {
-        kind: "head",
-        version: commit.baseVersion + commit.events.length - 1,
-        lastCommitKey: anchor.key,
-        lastCommitEtag: got.etag,
+        head: {
+          kind: "head",
+          version: commit.baseVersion + commit.events.length - 1,
+          lastCommitKey: anchor.key,
+          lastCommitEtag: got.etag,
+        },
+        watermark,
       };
     }
     throw new TransientStoreError(`head resolution for ${streamId} kept losing races; giving up`);
+  }
+
+  async function resolveHead(streamId: string): Promise<HeadResolution> {
+    validateStreamId(streamId);
+    return (await resolveHeadInternal(streamId)).head;
+  }
+
+  /**
+   * Step 5: best-effort head.json hint (plain LWW PUT). Off the critical
+   * path — transient failures are swallowed; regression is benign.
+   */
+  async function writeHint(streamId: string, hint: HeadHint): Promise<void> {
+    try {
+      await driver.put(headKey(prefix, streamId), JSON.stringify(hint));
+    } catch (err) {
+      if (!(err instanceof TransientStoreError)) throw err;
+    }
   }
 
   /** Conditional PUT with bounded transient retry; the commitId self-check
@@ -177,6 +295,7 @@ export function createEventStore(config: EventStoreConfig): EventStore {
     streamId: string,
     baseVersion: number,
     events: EventInput[],
+    watermark: number,
   ): Promise<AppendResult> {
     const committedAt = clock();
     const commit: CommitObject = {
@@ -193,12 +312,32 @@ export function createEventStore(config: EventStoreConfig): EventStore {
       committedAt,
     };
     const key = commitKey(prefix, streamId, baseVersion);
-    const result = await putCommit(key, JSON.stringify(commit));
+    const newHead = baseVersion + events.length - 1;
     const ok: AppendResult = {
       streamId,
-      nextExpectedVersion: baseVersion + events.length - 1,
+      nextExpectedVersion: newHead,
       committedAt,
+      // Trigger arithmetic (DESIGN.md, Scheduling): a base at least one full
+      // bucket past the watermark proves a sealed uncompacted bucket exists.
+      compactionSuggested: baseVersion >= watermark + chunkSize,
     };
+    /** Success bookkeeping: refresh the cache and the head.json hint. */
+    const won = async (etag: string | null): Promise<AppendResult> => {
+      if (etag !== null) {
+        headCache.set(streamId, { version: newHead, lastCommitKey: key, lastCommitEtag: etag, compactedTo: watermark });
+        await writeHint(streamId, {
+          headVersion: newHead,
+          lastCommitKey: key,
+          lastCommitEtag: etag,
+          compactedTo: watermark,
+        });
+      } else {
+        // Success proven via the chunk: no live key to point the hint at.
+        headCache.delete(streamId);
+      }
+      return ok;
+    };
+    const result = await putCommit(key, JSON.stringify(commit));
 
     if (result.kind === "created") {
       // Step 4: verify the target bucket has no chunk. Keyed on the
@@ -206,11 +345,12 @@ export function createEventStore(config: EventStoreConfig): EventStore {
       // event selects the next bucket, which can never be chunked first).
       switch (await chunkVerdict(streamId, baseVersion, commit.commitId)) {
         case "no-chunk":
-          return ok; // the overwhelmingly common case
+          return won(result.etag); // the overwhelmingly common case
         case "ours":
-          return ok; // lost response earlier; our commit already compacted
+          return won(null); // lost response earlier; our commit already compacted
         case "foreign":
           // The PUT recreated a freed key: unreadable orphan, sweep garbage.
+          headCache.delete(streamId);
           throw new ConcurrencyError(
             streamId,
             `append at version ${baseVersion} landed in an already-compacted bucket`,
@@ -221,14 +361,15 @@ export function createEventStore(config: EventStoreConfig): EventStore {
     // Step 3: 412. GET the key we just targeted and compare commitId.
     const got = await driver.get(key);
     if (got.kind === "found") {
-      if (parseCommit(got.body).commitId === commit.commitId) return ok; // we already won
+      if (parseCommit(got.body).commitId === commit.commitId) return won(got.etag); // we already won
       // A foreign commitId at the key is not yet proof we lost: our own
       // commit may have been compacted and its freed key recreated.
-      if ((await chunkVerdict(streamId, baseVersion, commit.commitId)) === "ours") return ok;
+      if ((await chunkVerdict(streamId, baseVersion, commit.commitId)) === "ours") return won(null);
     } else {
       // Key compacted since the 412 — check the bucket's chunk instead.
-      if ((await chunkVerdict(streamId, baseVersion, commit.commitId)) === "ours") return ok;
+      if ((await chunkVerdict(streamId, baseVersion, commit.commitId)) === "ours") return won(null);
     }
+    headCache.delete(streamId);
     throw new ConcurrencyError(streamId, `version ${baseVersion} was won by another writer`);
   }
 
@@ -252,7 +393,31 @@ export function createEventStore(config: EventStoreConfig): EventStore {
     let lastConflict: ConcurrencyError | undefined;
     for (let i = 0; i < attempts; i++) {
       // Step 1: head resolution — mandatory, authoritative for rejection.
-      const head = await resolveHead(streamId);
+      // The in-process cache may stand in for resolution only when it
+      // *agrees* with the caller's intent (a disagreement could be a stale
+      // cache, so it must never mint a rejection on its own — except for
+      // "noStream", where any observed head proves the stream exists).
+      const cached = headCache.get(streamId);
+      let state: ResolvedState;
+      if (cached && expected === "noStream") {
+        throw new ConcurrencyError(streamId, "expected no stream, but the stream exists");
+      } else if (
+        cached &&
+        (expected === "any" || (typeof expected === "number" && cached.version === expected))
+      ) {
+        state = {
+          head: {
+            kind: "head",
+            version: cached.version,
+            lastCommitKey: cached.lastCommitKey,
+            lastCommitEtag: cached.lastCommitEtag,
+          },
+          watermark: cached.compactedTo,
+        };
+      } else {
+        state = await resolveHeadInternal(streamId);
+      }
+      const head = state.head;
       if (expected === "noStream" && head.kind !== "noStream") {
         throw new ConcurrencyError(streamId, "expected no stream, but the stream exists");
       }
@@ -264,7 +429,7 @@ export function createEventStore(config: EventStoreConfig): EventStore {
       }
       const base = head.kind === "noStream" ? 0 : head.version + 1;
       try {
-        return await appendAt(streamId, base, events);
+        return await appendAt(streamId, base, events, state.watermark);
       } catch (err) {
         if (err instanceof ConcurrencyError && expected === "any") {
           lastConflict = err;
@@ -432,9 +597,37 @@ export function createEventStore(config: EventStoreConfig): EventStore {
     // proceeds — membership is deterministic, so the keys are identical and
     // deletes are idempotent.
     await driver.deleteMany(members.map((m) => m.key));
-    return put.kind === "created"
-      ? { status: "compacted", chunkBase: bucket }
-      : { status: "stood-down", chunkBase: bucket };
+    if (put.kind === "created") {
+      await advanceWatermark(streamId, bucket + chunkSize);
+      return { status: "compacted", chunkBase: bucket };
+    }
+    return { status: "stood-down", chunkBase: bucket };
+  }
+
+  /**
+   * Best-effort watermark bump on head.json (LWW read-modify-write,
+   * preserving the appenders' hint fields). Regression by a concurrent
+   * stale writer is benign: consumers treat head.json as a hint, and a
+   * regressed watermark costs at most a redundant, idempotent compaction
+   * pass (DESIGN.md, Scheduling).
+   */
+  async function advanceWatermark(streamId: string, watermark: number): Promise<void> {
+    try {
+      const got = await driver.get(headKey(prefix, streamId));
+      const prev = got.kind === "found" ? (JSON.parse(got.body) as HeadHint) : null;
+      if (prev !== null && prev.compactedTo >= watermark) return;
+      await driver.put(
+        headKey(prefix, streamId),
+        JSON.stringify({
+          headVersion: prev?.headVersion ?? null,
+          lastCommitKey: prev?.lastCommitKey ?? null,
+          lastCommitEtag: prev?.lastCommitEtag ?? null,
+          compactedTo: watermark,
+        } satisfies HeadHint),
+      );
+    } catch (err) {
+      if (!(err instanceof TransientStoreError)) throw err;
+    }
   }
 
   /**
