@@ -142,7 +142,9 @@ Why the head check cannot be skipped — silent corruptions otherwise:
   "baseVersion": 5,
   "events": [
     {
-      "id": "uuid",                // idempotency / dedupe key
+      "id": "uuid",                // idempotency / dedupe key; library-generated
+                                   // unless the caller supplies one (e.g. for
+                                   // domain-level idempotent retries)
       "type": "OrderShipped",
       "version": 5,
       "data": { ... },
@@ -221,7 +223,9 @@ await repo.save("order-123", version, newEvents);
 `SerializationError`, plus passthrough of SDK errors. All typed, all exported.
 
 `expectedVersion` semantics:
-- number `n` → commit must land at version `n+1`
+- number `n` → commit must land at version `n+1`; `n ≥ 0` — the first
+  append to a stream is expressed as `"noStream"`, and `-1` is rejected
+  rather than aliased (one spelling per intent)
 - `"noStream"` → stream must not exist, verified by head resolution finding
   no commits *and* no chunks — never by the PUT alone (on a compacted
   stream `e/0` is a freed key and a blind create-only PUT would "succeed")
@@ -291,7 +295,10 @@ bulk-migration path. `waitUntil`'s post-response wall-clock allowance
 (~30 s) bounds the GET phase — comfortable for ~N parallel, I/O-bound GETs.
 N is a store-level constant: chunk keys and REST page URLs derive from
 it, so changing it under existing data means a full recompaction — pick once,
-record it in store config.
+record it in store config. N bounds request count, not bytes: the compactor
+buffers a whole bucket while assembling its chunk, so pair the N-event cap
+with a **per-commit byte cap** (store config, low single-digit MB) to keep
+chunks well under Workers' 128 MB memory limit and REST page assembly cheap.
 
 **Compactor steps (per stream):**
 
@@ -302,6 +309,9 @@ record it in store config.
    tail where appends and head-hint readers operate. The lag is structural,
    not clock-based.
 3. GET the bucket's commits, write one chunk object with `If-None-Match: *`.
+   A 404 on a source commit mid-GET means a racing winner is already
+   deleting sources; its chunk necessarily exists (chunk PUT strictly
+   precedes deletes) — confirm the chunk and stand down.
 4. Only after the chunk PUT succeeds, batch-DELETE the source commit objects
    (`DeleteObjects` / the binding's array `delete` — one call, ≤1000 keys).
 5. Sweep: delete any commit whose baseVersion falls in an existing chunk's
@@ -313,8 +323,9 @@ record it in store config.
 - *Crash between 3 and 4* → events exist in both chunk and commits.
   Duplication, not corruption; readers dedupe (below), the sweep cleans up.
 - *Racing compactors* → deterministic boundaries mean identical chunk keys;
-  `If-None-Match: *` picks one winner, the loser 412s and proceeds to deletes.
-  Same lock-free primitive as the append path.
+  `If-None-Match: *` picks one winner, the loser 412s and proceeds to deletes
+  (or stands down earlier via step 3's 404 rule). Same lock-free primitive
+  as the append path.
 - *Reader racing the deletes* → two shapes, both recoverable because chunk
   PUT strictly precedes deletes (the data is always in one of the two
   places). **GET-time**: a 404 on a commit the reader just LISTed means
@@ -359,6 +370,14 @@ path that already runs:
   commits exists behind the head" (tracked as a `compactedTo` watermark
   piggybacked on `head.json`, which the append path already writes) — so a
   died `waitUntil` task is retried by the next boundary-crossing append.
+  Two writer populations update `head.json` (appenders bump the hint,
+  compactors advance the watermark) with plain last-writer-wins PUTs, so a
+  field can regress — an appender's stale read-modify-write can undo a
+  watermark bump. Benign by construction: every consumer treats `head.json`
+  as a hint, and a regressed watermark costs at most a redundant,
+  idempotent compaction pass. Upgrading these updates to `If-Match` CAS is
+  an optimization to reach for if the waste ever shows up, not a
+  correctness fix.
   Appends are also the **only** invocations that fire compaction: an
   append's own subrequest cost is small, so ~N compaction GETs fit
   comfortably in the shared budget. (A read-triggered backstop was
@@ -390,6 +409,16 @@ the deployment wires them into its append/read handlers (or the queue).
   drivers and the browser client stay tree-shakeable for Workers bundles.
 - **Tests**:
   - Unit: key codec, envelope schema, version math, error mapping (mock SDK).
+  - **Simulation (the highest-leverage suite):** a deterministic in-memory
+    S3 model — strong consistency, conditional PUTs, versioned-bucket
+    delete markers (DELETE then `If-None-Match: *` re-create succeeds: the
+    freed-key mechanism append step 4 exists for), injectable pauses, 412s,
+    404s — driving randomized interleavings of appenders, compactors, and
+    readers. Property-checked invariants: no lost events, no duplicate
+    versions, readers always observe a contiguous prefix. Most of this
+    design's correctness lives in race windows an integration suite can
+    only sample; the simulator explores them deterministically and replays
+    any failing schedule from its seed.
   - Integration: MinIO or LocalStack via testcontainers — **verify the emulator
     honors `If-None-Match`/`If-Match` semantics** (recent MinIO and LocalStack
     do; pin versions). A small nightly job against real S3 **and real R2**
@@ -616,8 +645,11 @@ inside the ~30-day erasure window.
 **Storage drivers.** Workers access R2 via native bindings
 (`env.BUCKET.put(key, val, { onlyIf })`) — no request signing, no SDK weight.
 The core therefore defines a minimal driver interface
-(`get` / `putIfAbsent` / `putIfMatch` / `list` / `delete`) with three
-implementations:
+(`get` / `putIfAbsent` / `putIfMatch` / `list` / `delete` / `deleteMany`)
+with three implementations. Batch delete is first-class because compaction
+needs it; `list` takes a prefix plus `startAfter` and returns
+lexicographically ordered pages with an explicit continuation token — the
+contract the head-discovery and read paths assume. Implementations:
 
 - `r2-binding` — native bindings; **conformance-test its `onlyIf`
   conditional-put semantics against the S3-API behavior in phase 1** before
@@ -702,6 +734,14 @@ prefixes are simply distinct permanent cache entries. Rules:
 3. **A prefix is a grouping, not a consistency boundary** — no cross-stream
    transactions within it (same non-goal as ever) — **and not an
    enumeration API**: "all streams under app-x" is a projection, not a LIST.
+4. **Validate before mapping.** Reject `streams` as a prefix segment — a
+   prefix like `app-x/streams/evil` would nest one store's owned subtree
+   inside another's, violating the ownership rule (scoped LISTs happen to
+   make it benign today, but the invariant should hold by construction, not
+   by accident). Normalize percent-encoding before the path↔key mapping,
+   reject empty segments, and enforce S3's 1024-byte key limit against the
+   longest key a request can produce (prefix + streamId +
+   `/e/{12 digits}.json`).
 
 Side benefit: authorization tends to align with application grouping, so the
 worker gets a natural hook for per-app policy — path-prefix middleware,
@@ -785,16 +825,23 @@ cached response is ever invalidated by compaction. Rules that make this hold:
    retry latency, not an error.
 3. **Page boundaries are a deterministic function of the version, aligned to
    chunk size N.** Two response classes fall out:
-   - *Full pages* (ending before head): immutable forever →
-     `Cache-Control: immutable`, permanent edge-cache entries. After
-     compaction a cache miss costs exactly one chunk GET — the REST page is
-     a 1:1 logical proxy of a chunk.
+   - *Full pages* (ending before head): immutable **content**, but
+     cacheability depends on what the bytes are. Unencrypted streams and
+     model-B ciphertext pages get `Cache-Control: immutable` and permanent
+     edge-cache entries. Model-A plaintext pages are just as immutable but
+     must be cached with **auth-scoped keys and a bounded TTL** that joins
+     the shred-propagation budget (see Serverless deployment) — immutability
+     is a property of the content, cache lifetime a property of the erasure
+     story. After compaction a cache miss costs ~1–2 chunk GETs: pages
+     align to event-version ranges while chunks bucket by *base*, so a
+     commit straddling a page boundary makes that page draw from two
+     adjacent chunks.
    - *The final partial page* (containing head): short TTL / no-store, same
      as `GET head`.
 
 Net effect: a long replay streams almost entirely from the edge cache
 regardless of whether compaction has run; compaction only changes what a
-cache miss costs (~1 chunk GET vs ~N commit GETs). This is also what makes
+cache miss costs (~1–2 chunk GETs vs ~N commit GETs). This is also what makes
 write-only compaction triggering acceptable (see Scheduling): even a stream
 whose final buckets never get compacted pays the uncompacted price once per
 edge location, after which its immutable pages serve from cache. Cache, API,
@@ -829,7 +876,7 @@ that's subscriptions/projections, phase 4.)
 | Phase | Scope |
 |-------|-------|
 | 0 | Scaffold: tsup, vitest, CI, key codec + envelope with 100% unit coverage |
-| 1 | Storage-driver interface + `r2-binding`/`aws-sdk`/`aws4fetch` drivers (incl. `onlyIf` conformance tests); `append`/`read` + optimistic concurrency + error taxonomy + integration tests |
+| 1 | Storage-driver interface + `r2-binding`/`aws-sdk`/`aws4fetch` drivers (incl. `onlyIf` conformance tests); `append`/`read` + optimistic concurrency + error taxonomy + **deterministic simulation harness** + integration tests |
 | 2 | Head hints, in-process head cache, repository helper, **compaction** (the replay mitigation, now snapshot-free) |
 | 3 | S3 Express backend, compression + whole-payload crypto-shredding serializer with pluggable key store, browser client SDK (`./client`) |
 | 4 | Subscriptions: checkpointed catch-up + EventBridge/SQS adapter |
