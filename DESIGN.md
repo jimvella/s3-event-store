@@ -79,38 +79,59 @@ in the id. Prefixes follow the same no-PII rule as stream IDs (see Erasure).
    and once compaction can delete keys, absence no longer implies "next
    version" (see below).
 2. `PutObject` the commit object at key `e/{head+1}` with `If-None-Match: *`.
-   The body carries a writer-generated `commitId`.
+   The body carries a writer-generated `commitId`. A commit holds at most
+   **N events** (the chunk size — see Compaction); larger atomic appends are
+   rejected at the API.
 3. On HTTP 412: GET the key just targeted and compare `commitId`. If it is
    ours, we already won — the original PUT succeeded but its response was
    lost, and the transport-level retry collided with our own object; report
    success. (Without this check, a retried conditional PUT is
    indistinguishable from a lost race, and a timed-out-but-successful append
    surfaces as `ConcurrencyError` — the caller re-reads, sees its own events,
-   and may double-append.) Otherwise another writer won → raise
-   `ConcurrencyError` (caller retries: re-read, re-decide, re-append).
-4. Best-effort update `head.json` (plain PUT, last-writer-wins; it is only a
-   hint, never trusted for correctness).
+   and may double-append.) If the GET 404s, the key was compacted since the
+   412 — fetch the bucket's chunk and compare `commitId` there instead.
+   Otherwise another writer won → raise `ConcurrencyError` (caller retries:
+   re-read, re-decide, re-append).
+4. On success, **verify the target bucket has no chunk**: GET
+   `c/{⌊v/N⌋·N}` for the version v just written. 404 — the overwhelmingly
+   common case — confirms the append. An existing chunk that lacks our
+   `commitId` means the PUT recreated a freed key: the events are invisible
+   to readers and the sweep will delete the object, so raise
+   `ConcurrencyError` (the orphan is sweep garbage, never corruption). A
+   chunk that *contains* our `commitId` is the lost-response case again:
+   report success.
+5. Best-effort update `head.json` (plain PUT, last-writer-wins; contents and
+   the corroboration rule under Head discovery below).
 
 This is lock-free and correct: two writers targeting the same version can never
 both succeed, and a commit object containing N events is atomic by construction
 (one PUT). Division of labor: head resolution rejects stale intent; the
-conditional PUT guards only the resolve→PUT race window. Within that window
-it is sound: freeing the target key would require a full bucket of later
-commits *plus* a complete compaction cycle to land inside the window, and
-compaction never touches keys at or above the head.
+conditional PUT guards the resolve→PUT race window; the step-4 chunk check
+closes the one hole the PUT cannot see. That hole: the window is unbounded
+on the client side (GC pause, SDK retry backoff spanning tens of seconds),
+so a writer stalled long enough for a full bucket of later commits *plus* a
+compaction cycle to land inside it finds its target key freed — the
+create-only PUT "succeeds", but readers ignore commits in chunked buckets
+and the sweep deletes the object. Silent data loss, reported as success.
+The chunk check is airtight, not best-effort: contenders for the same
+resolved head always target the same key (bases are deterministic), so an
+absent target key implies it was created and then compacted — the chunk
+existed *before* our PUT, and strong read-after-write guarantees the step-4
+GET observes it.
 
-Why the head check cannot be skipped — three silent corruptions otherwise:
+Why the head check cannot be skipped — silent corruptions otherwise:
 
-- `"noStream"` on a compacted stream: bucket 0's commits are deleted, so a
-  blind create-only PUT at `e/0` **succeeds** — but readers ignore commits
-  whose bucket has a chunk, so the append reports success while its events
-  are unreadable forever.
-- Stale-low `expectedVersion` below the compaction watermark: same
-  mechanism — a spurious "success" instead of `ConcurrencyError`.
 - Stale-high `expectedVersion`: the PUT lands at an unoccupied future key,
   creating an orphan commit past a version gap; head discovery (LIST max)
   then treats the orphan as the head and the stream is permanently
-  corrupted.
+  corrupted. Head resolution is the **only** defense — a future bucket has
+  no chunk, so the step-4 check passes.
+- `"noStream"` on a compacted stream: bucket 0's commits are deleted, so a
+  blind create-only PUT at `e/0` **succeeds** — but readers ignore commits
+  whose bucket has a chunk, so the append reports success while its events
+  are unreadable forever. Same mechanism for a stale-low `expectedVersion`
+  below the compaction watermark. Step 4 backstops both, but head
+  resolution rejects them with the right error before garbage is written.
 
 **Commit object body** (JSON):
 
@@ -138,10 +159,23 @@ come from reading, never from key arithmetic.
 
 **Head discovery** — the one awkward part of S3 (you can't LIST descending):
 
-- Fast path: read `head.json` hint, then `ListObjectsV2` with
-  `StartAfter: e/{hintVersion}` to pick up anything newer. Usually 1 GET + 1
-  short LIST.
-- Cold path (no hint): paginate LIST over the `e/` prefix (1000 keys/page).
+- `head.json` records `{ headVersion, lastCommitKey, compactedTo }` — the
+  hint, its evidence, and the compaction watermark (see Scheduling).
+- Fast path: read the hint, then `ListObjectsV2` with
+  `StartAfter: e/{headVersion}` to pick up anything newer. If the LIST
+  returns keys, the newest commit anchors the head (GET it — version math
+  comes from reading). If it returns nothing, the hint is the only
+  evidence: **HEAD `lastCommitKey` to corroborate it** before trusting it;
+  on 404, fall back to the cold path. Within the protocol the hint can only
+  be stale-low (it is written after successful appends), but a stale-high
+  hint from outside — manual deletion, a bucket restore, a foreign writer —
+  would otherwise be accepted silently and mint the stale-high orphan
+  corruption above. One HEAD makes hint corruption fail safe instead of
+  fail corrupt. Usually 1 GET + 1 short LIST + 1 HEAD.
+- Cold path (no or invalidated hint): paginate LIST over the `e/` prefix
+  (1000 keys/page). A non-empty stream always has commits under `e/` — the
+  highest occupied bucket can never seal (sealing requires a successor
+  bucket to have started), so compaction never empties the tail.
 - If the conditional PUT 412s, the head moved — re-list from the hint and retry.
 
 **Read protocol**: LIST the `e/` prefix, GET each commit object, yield
@@ -235,21 +269,27 @@ coordination.
 
 Buckets are fixed windows over base-version space and never resize — that
 determinism is what lets uncoordinated compactors compute identical chunk
-keys. One consequence: a commit with more than N events can straddle far
-enough that the next bucket contains no bases at all (base 499 + 600 events
-→ next base 1099; bucket [500, 999] is empty). Empty buckets get **no chunk
-object** — the compactor skips them and the `compactedTo` watermark advances
-past them. Chunk keys are therefore not dense, which readers already
-tolerate: chunks are discovered by LISTing `c/`, never by key arithmetic,
-and a REST page covering an empty bucket's version range is served from the
-preceding straddling chunk by the read handler.
+keys. Commits are capped at **N events** (enforced at append; an atomic
+append of 500+ events is beyond any reasonable use case), and the cap keeps
+bucket space dense: a straddling commit's next base always lands in the
+immediately following bucket (base b ∈ [kN, kN+N−1] with count ≤ N ⇒ next
+base < (k+2)·N), so **no bucket is ever empty** and chunk keys are dense up
+to the compaction watermark. Readers still discover chunks by LISTing `c/`,
+never by key arithmetic — defense-in-depth, not a load-bearing assumption.
 
 **Chunk size N = 500, fixed per store.** The Workers deployment runs
 compaction inside `waitUntil`, which shares the invoking request's
 ~1,000-subrequest budget (R2 binding calls count); one chunk costs ~N GETs +
 1 PUT + 1 batched DELETE, so N = 500 leaves headroom for the request's own
 work — which is always an append's few calls, since compaction is
-write-triggered only (see Scheduling). N is a store-level constant: chunk keys and REST page URLs derive from
+write-triggered only (see Scheduling). `compactStream` therefore compacts
+**at most one bucket per invocation**: a backlog of several sealed buckets
+(a long-idle stream healing, or adopting compaction over existing data)
+would blow the budget in one shot; the state-derived trigger drains a
+backlog across subsequent appends, and the queue variant is the
+bulk-migration path. `waitUntil`'s post-response wall-clock allowance
+(~30 s) bounds the GET phase — comfortable for ~N parallel, I/O-bound GETs.
+N is a store-level constant: chunk keys and REST page URLs derive from
 it, so changing it under existing data means a full recompaction — pick once,
 record it in store config.
 
@@ -265,7 +305,8 @@ record it in store config.
 4. Only after the chunk PUT succeeds, batch-DELETE the source commit objects
    (`DeleteObjects` / the binding's array `delete` — one call, ≤1000 keys).
 5. Sweep: delete any commit whose baseVersion falls in an existing chunk's
-   bucket (garbage from a crash between 3 and 4).
+   bucket (garbage from a crash between 3 and 4, or a freed-key recreation
+   already rejected by append step 4).
 
 **Failure modes, all harmless:**
 
@@ -364,8 +405,14 @@ the deployment wires them into its append/read handlers (or the queue).
 - PUT/LIST ≈ $0.005 per 1k, GET ≈ $0.0004 per 1k. An aggregate with 1M commits
   costs ~$5 to write, storage is negligible. Reads dominated by request count →
   commit batching and compaction matter more than payload size.
-- Append latency ≈ 1 GET (hint) + 1 LIST + 1 PUT ≈ 60–150 ms on standard S3.
-  Cache the head in-process per stream to make hot-stream appends ≈ 1 PUT.
+- Append latency ≈ 1 GET (hint) + 1 LIST + 1 HEAD (hint corroboration) +
+  1 PUT + 1 GET (step-4 chunk check, a fast 404) ≈ 60–150 ms on standard S3.
+  Cache the head in-process per stream to make hot-stream appends ≈ 1 PUT +
+  1 GET: the cache is a hint that skips resolution, and skipping is sound
+  *only because of* the step-4 chunk check — a stale-low cache plus
+  compaction is exactly the freed-key case it catches (a 412 already forces
+  re-resolution, and stale-high cannot arise: the process only caches heads
+  it observed).
 - Long streams: reading 10k commits = 10k GETs. Mitigations, in order:
   background **compaction** into chunk objects (see Compaction protocol —
   with no snapshot layer it is the primary replay mitigation, hence early in
@@ -792,7 +839,9 @@ that's subscriptions/projections, phase 4.)
 
 1. **Commit granularity**: always allow multi-event commits (chosen above), or
    force one-event-per-object for dense keys? Multi-event is the right default
-   — atomic use-case appends are the whole point of `expectedVersion`.
+   — atomic use-case appends are the whole point of `expectedVersion` — capped
+   at N events per commit, which is what keeps bucket space dense (see
+   Compaction).
 2. ~~Key-store choice~~ **Resolved**: a dedicated S3 bucket with wrapped keys
    is the default backend (see Erasure section); alternatives via the
    `KeyStore` interface.
