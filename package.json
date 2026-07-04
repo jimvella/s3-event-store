@@ -1,20 +1,94 @@
 {
   "name": "s3-event-store",
   "version": "0.0.0",
+  "description": "Event sourcing directly on S3-compatible object storage — no database, no server. Optimistic concurrency via conditional writes; compaction; crypto-shredding erasure.",
   "private": true,
   "type": "module",
+  "sideEffects": false,
   "engines": {
     "node": ">=20"
   },
+  "files": [
+    "dist"
+  ],
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./client": {
+      "import": {
+        "types": "./dist/client.d.ts",
+        "default": "./dist/client.js"
+      },
+      "require": {
+        "types": "./dist/client.d.cts",
+        "default": "./dist/client.cjs"
+      }
+    },
+    "./drivers/aws-sdk": {
+      "import": {
+        "types": "./dist/drivers/aws-sdk.d.ts",
+        "default": "./dist/drivers/aws-sdk.js"
+      },
+      "require": {
+        "types": "./dist/drivers/aws-sdk.d.cts",
+        "default": "./dist/drivers/aws-sdk.cjs"
+      }
+    },
+    "./drivers/r2-binding": {
+      "import": {
+        "types": "./dist/drivers/r2-binding.d.ts",
+        "default": "./dist/drivers/r2-binding.js"
+      },
+      "require": {
+        "types": "./dist/drivers/r2-binding.d.cts",
+        "default": "./dist/drivers/r2-binding.cjs"
+      }
+    },
+    "./drivers/aws4fetch": {
+      "import": {
+        "types": "./dist/drivers/aws4fetch.d.ts",
+        "default": "./dist/drivers/aws4fetch.js"
+      },
+      "require": {
+        "types": "./dist/drivers/aws4fetch.d.cts",
+        "default": "./dist/drivers/aws4fetch.cjs"
+      }
+    }
+  },
   "scripts": {
+    "build": "tsup",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "sweep": "node scripts/sweep.mjs"
+  },
+  "peerDependencies": {
+    "@aws-sdk/client-s3": "^3.600.0",
+    "aws4fetch": "^1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@aws-sdk/client-s3": {
+      "optional": true
+    },
+    "aws4fetch": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@aws-sdk/client-s3": "^3.1079.0",
     "@types/node": "^24.0.0",
     "aws4fetch": "^1.0.20",
+    "tsup": "^8.5.1",
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
   }

@@ -247,11 +247,16 @@ startup config verification), and the crypto-shredding workflow
 period, sweeper-executed hard delete). The deterministic simulation harness
 (`sim/`; see [SIMULATOR_PLAN.md](SIMULATOR_PLAN.md)) checks the full
 invariant set, including no-forged-heads and every-committed-event-readable
-after every mutation. Still ahead per [DESIGN.md](DESIGN.md#roadmap):
-package/build plumbing, encryption (KEYS_DESIGN.md), the browser client,
+after every mutation. Also done: the browser client SDK (`./client` —
+keyring fetch/TTLs, local AES-GCM decryption, link-following with
+permanent complete-page caching, upcasters, fold) and the build plumbing
+(`npm run build`: tsup dual ESM/CJS + `.d.ts` for all five subpath
+exports; SDKs as optional peers). The package stays `private: true` until
+a publish decision. Still ahead per [DESIGN.md](DESIGN.md#roadmap):
 MinIO/testcontainers conformance (deferred — real S3 and R2 are covered by
-the env-gated run below), and an in-Workers conformance run for the
-r2-binding driver's `onlyIf` semantics.
+the file-configured run below), an in-Workers conformance run for the
+r2-binding driver's `onlyIf` semantics, and demand-gated field-level
+encryption.
 
 ### Testing
 
