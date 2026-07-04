@@ -1,8 +1,30 @@
 {
-  "name": "s3-event-store",
-  "version": "0.0.0",
+  "name": "@jimvella/s3-event-store",
+  "version": "0.1.0",
   "description": "Event sourcing directly on S3-compatible object storage — no database, no server. Optimistic concurrency via conditional writes; compaction; crypto-shredding erasure.",
-  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimvella/s3-event-store.git"
+  },
+  "homepage": "https://github.com/jimvella/s3-event-store#readme",
+  "bugs": {
+    "url": "https://github.com/jimvella/s3-event-store/issues"
+  },
+  "keywords": [
+    "event-sourcing",
+    "event-store",
+    "s3",
+    "r2",
+    "cloudflare-workers",
+    "optimistic-concurrency",
+    "conditional-writes",
+    "crypto-shredding",
+    "gdpr"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "sideEffects": false,
   "engines": {
@@ -70,7 +92,8 @@
     "build": "tsup",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "sweep": "node scripts/sweep.mjs"
+    "sweep": "node scripts/sweep.mjs",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
   },
   "peerDependencies": {
     "@aws-sdk/client-s3": "^3.600.0",

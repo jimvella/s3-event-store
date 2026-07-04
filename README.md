@@ -44,7 +44,7 @@ service. Everything else is deployment code you own.
 
 | Component | What it is |
 |---|---|
-| **Core library** (`s3-event-store`) | Event store (`append`/`read`), storage-driver interface, error taxonomy, serializers (including the encrypting one), `KeyStore` interface, `compactStream()` + trigger check, shred workflow helpers |
+| **Core library** (`@jimvella/s3-event-store`) | Event store (`append`/`read`), storage-driver interface, error taxonomy, serializers (including the encrypting one), `KeyStore` interface, `compactStream()` + trigger check, shred workflow helpers |
 | **Storage drivers** (`./drivers/*`) | `aws-sdk` (Node, `@aws-sdk/client-s3` as optional peer), `r2-binding` (native Cloudflare Workers bindings — no SDK weight), `aws4fetch` (lightweight SigV4 for calling S3/R2 from Workers) |
 | **Browser client SDK** (`./client`) | Zero-dependency, WebCrypto-only reader for encrypted streams: keyring fetch/cache, per-event key selection, AES-GCM decrypt, cursor iteration, upcasting |
 | **Your application worker** | Thin HTTP handlers over the library: authenticate → rehydrate → enforce invariants → append. The library ships no routes — auth and invariants are domain concerns |
@@ -61,7 +61,7 @@ deliberately out of scope — sketched as unplanned future work in
 ## Installation and setup
 
 ```sh
-npm install s3-event-store
+npm install @jimvella/s3-event-store
 
 # Node deployments using the AWS SDK driver also need the optional peer:
 npm install @aws-sdk/client-s3
@@ -99,8 +99,8 @@ to the prefix. Writers need conditional-PUT support; nothing needs
 ### Create a store and append events
 
 ```ts
-import { createEventStore, ConcurrencyError } from "s3-event-store";
-import { awsSdkDriver } from "s3-event-store/drivers/aws-sdk";
+import { createEventStore, ConcurrencyError } from "@jimvella/s3-event-store";
+import { awsSdkDriver } from "@jimvella/s3-event-store/drivers/aws-sdk";
 import { S3Client } from "@aws-sdk/client-s3";
 
 const store = createEventStore({
@@ -157,8 +157,8 @@ hide S3 latency. Order within a stream is guaranteed.
 ### Cloudflare Workers + R2
 
 ```ts
-import { createEventStore } from "s3-event-store";
-import { r2BindingDriver } from "s3-event-store/drivers/r2-binding";
+import { createEventStore } from "@jimvella/s3-event-store";
+import { r2BindingDriver } from "@jimvella/s3-event-store/drivers/r2-binding";
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
@@ -206,7 +206,7 @@ delivery, per-event key selection by `keyId`, and AES-GCM decryption —
 WebCrypto only, zero dependencies:
 
 ```ts
-import { createStreamClient } from "s3-event-store/client";
+import { createStreamClient } from "@jimvella/s3-event-store/client";
 
 const client = createStreamClient({
   baseUrl: "https://api.example.com/app-x/orders",
