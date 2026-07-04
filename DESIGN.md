@@ -518,7 +518,8 @@ the deployment wires them into its append/read handlers (or the queue).
   drivers and the browser client stay tree-shakeable for Workers bundles.
 - **Tests**:
   - Unit: key codec, envelope schema, version math, error mapping (mock SDK).
-  - **Simulation (the highest-leverage suite):** a deterministic in-memory
+  - **Simulation (the highest-leverage suite** — implementation plan in
+    [SIMULATOR_PLAN.md](SIMULATOR_PLAN.md)**):** a deterministic in-memory
     S3 model — strong consistency, conditional PUTs, conditional GETs
     (`If-Match`), versioned-bucket
     delete markers (DELETE then `If-None-Match: *` re-create succeeds: the
@@ -972,8 +973,9 @@ conceded honestly:
   but designated-writer patterns could want them — implementable later as
   an ordinary event type checked at append time.
 - A **deterministic simulation harness** (`sim/`: seed-replayable,
-  linearizability-checked, simulated object store) — prior art worth
-  reading before building the phase-1 harness; it validates the approach.
+  linearizability-checked, simulated object store) — read in detail
+  2026-07; what transfers and what doesn't is worked through in
+  [SIMULATOR_PLAN.md](SIMULATOR_PLAN.md).
 
 **Other candidates, and why they don't overlap:**
 
