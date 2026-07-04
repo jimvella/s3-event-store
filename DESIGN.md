@@ -105,7 +105,12 @@ no-PII rule as stream IDs (see the Encryption & erasure contract).
    our `commitId` did another writer win → raise `ConcurrencyError`
    (caller retries: re-read, re-decide, re-append).
 4. On success, **verify the target bucket has no chunk**: GET
-   `c/{⌊v/N⌋·N}` for the version v just written. 404 — the overwhelmingly
+   `c/{⌊b/N⌋·N}` for the **baseVersion** b just written. Base, not last
+   event version: membership is by base, and for a boundary-straddling
+   commit the last event's version selects the *next* bucket — which can
+   never be chunked before this one (chunks are dense, compacted
+   lowest-first), so the mis-keyed check would 404 and false-pass exactly
+   when it must fire. 404 — the overwhelmingly
    common case — confirms the append. An existing chunk that lacks our
    `commitId` means the PUT recreated a freed key: the events are unreadable
    — readers ignore commits in chunked buckets, and the pinned-GET and
@@ -115,7 +120,8 @@ no-PII rule as stream IDs (see the Encryption & erasure contract).
    object, so raise `ConcurrencyError` (the orphan is sweep garbage, never
    corruption). A chunk that *contains* our `commitId` is the lost-response
    case again: report success.
-5. Best-effort update `head.json` (plain PUT, last-writer-wins; contents and
+5. Best-effort update `head.json` with the new commit's key and the ETag
+   the PUT response returned (plain PUT, last-writer-wins; contents and
    the corroboration rule under Head discovery below).
 
 This is lock-free and correct: two writers targeting the same version can never
@@ -176,22 +182,48 @@ come from reading, never from key arithmetic.
 
 **Head discovery** — the one awkward part of S3 (you can't LIST descending):
 
-- `head.json` records `{ headVersion, lastCommitKey, compactedTo }` — the
-  hint, its evidence, and the compaction watermark (see Scheduling).
+- `head.json` records `{ headVersion, lastCommitKey, lastCommitEtag,
+  compactedTo }` — the hint, its evidence (key *and* ETag, written by the
+  same PUT so the pair can regress together but never split), and the
+  compaction watermark (see Scheduling).
+- **Every anchor GET is pinned.** Whichever path runs, resolution ends by
+  GETting one commit and deriving the head from its body (base + event
+  count − 1) — and that GET always carries `If-Match`: the ETag the `e/`
+  LIST reported for the key, or `lastCommitEtag` when the hint itself is
+  the anchor. Unpinned, the freed-key substitution the read path pins
+  against (see Compaction failure modes) forges heads *upward*: between
+  the LIST and the GET, later appends seal the anchor's bucket, a
+  compactor frees its key, and a stalled writer's recreation — base
+  matching the key, event count its own — derives a head past the real
+  one. Stale-high is precisely the input head resolution exists to reject
+  (the PUT lands at an unoccupied future key and step 4 sees an unchunked
+  future bucket — the orphan-past-a-gap corruption with no failing check),
+  so an unpinned anchor would poison the only defense. The pin costs
+  nothing — LISTs already return ETags. On 412 or 404 the anchor is gone
+  or replaced: re-resolve (re-LIST, or fall to the cold path when the
+  hint was the anchor).
 - Fast path: read the hint, then `ListObjectsV2` with
   `StartAfter: lastCommitKey` — the key, not a version the hint asserts,
   so `headVersion` is never load-bearing for resolution. If the LIST
-  returns keys, the newest commit anchors the head (GET it — version math
+  returns keys, the newest commit anchors the head — paginate to the
+  final page first when the hint is very stale (never anchor on an
+  intermediate page's max), then GET the anchor pinned to its listed
+  ETag (version math
   comes from reading). If it returns nothing, the hint is the only
-  evidence: **GET `lastCommitKey` and derive the head from its contents**
-  (base + event count − 1); on 404, fall back to the cold path. Within
+  evidence: **GET `lastCommitKey` pinned to `lastCommitEtag` and derive
+  the head from its contents**
+  (base + event count − 1); on 404 or 412, fall back to the cold path.
+  Within
   the protocol the hint can only
   be stale-low (it is written after successful appends), but a stale-high
   hint from outside — manual deletion, a bucket restore, a foreign writer —
   would otherwise be accepted silently and mint the stale-high orphan
   corruption above. Existence alone is not corroboration: a fabricated
   `headVersion` beside a real `lastCommitKey` would pass a bare HEAD and
-  still mint the orphan. Deriving the head from the commit body makes
+  still mint the orphan — and the key alone is not either: a freed-key
+  recreation at `lastCommitKey` is a plausible commit body that is *not*
+  the commit the hint referenced, which is what the ETag pin closes.
+  Deriving the head from the pinned commit body makes
   every hint corruption fail safe instead of
   fail corrupt. Usually 1 GET (hint) + 1 short LIST + 1 GET (tail anchor
   or corroboration). `headVersion` stays in `head.json` as a
@@ -199,7 +231,9 @@ come from reading, never from key arithmetic.
 - Cold path (no or invalidated hint): LIST `c/` first and GET the last
   chunk — its recorded last commit key seeds `StartAfter` for the `e/`
   LIST, so the walk covers only the uncompacted tail rather than every
-  commit ever written. Then paginate LIST over `e/` (1000 keys/page). A
+  commit ever written. Then paginate LIST over `e/` (1000 keys/page) to
+  the end; the final key anchors the head, GET it pinned to its listed
+  ETag like any anchor. A
   non-empty stream always has commits under `e/` — the highest occupied
   bucket can never seal (sealing requires a successor bucket to have
   started), so compaction never empties the tail.
@@ -520,7 +554,12 @@ the deployment wires them into its append/read handlers (or the queue).
     listed key is compacted, freed, and recreated before its GET, and the
     multi-bucket schedule where two buckets are chunked between a reader's
     `c/` and `e/` LISTs with keys recreated in both — the case the
-    sealed-bucket check must *iterate* to catch), readers
+    sealed-bucket check must *iterate* to catch), no forged heads (head
+    resolution never derives a head from a substituted anchor — the
+    schedule where the newest listed commit's bucket is sealed, chunked,
+    and its key recreated between a resolver's LIST and its anchor GET,
+    which the pinned anchors and `lastCommitEtag` corroboration exist
+    for), readers
     always observe a contiguous prefix.
     Most of this
     design's correctness lives in race windows an integration suite can
@@ -675,8 +714,11 @@ declare a bounded TTL; those TTLs feed the unified shred-delay budget in
 The core therefore defines a minimal driver interface
 (`get` / `putIfAbsent` / `putIfMatch` / `list` / `delete` / `deleteMany`)
 with three implementations. `get` takes an optional `ifMatch` etag — the
-read path's pinned GETs depend on it (S3 `GetObject` `IfMatch`, R2 binding
+read path's pinned GETs and head resolution's pinned anchors depend on it
+(S3 `GetObject` `IfMatch`, R2 binding
 `onlyIf.etagMatches`; conformance-test alongside the conditional PUTs).
+Puts return the created object's etag — append step 5 records it as
+`lastCommitEtag` without an extra request.
 Batch delete is first-class because compaction
 needs it; `list` takes a prefix plus `startAfter` and returns
 lexicographically ordered pages — each key with its etag, which the pinned
