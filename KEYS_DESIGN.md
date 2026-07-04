@@ -135,8 +135,13 @@ tombstones/{subjectId}.json        # shred state machine (see Shred protocol)
   generation. The layout is what makes the shred protocol's listings
   well-defined.
 - The prefixes are also the IAM boundary: minters and rotation hold
-  `PutObject`/`GetObject` on `keys/*` plus read on `tombstones/*` (the
-  mint's pre-check and re-check); the shred initiator reads and writes
+  LIST/`PutObject`/`GetObject` on `keys/*` — LIST is load-bearing, a
+  mint *is* LIST + PUT — plus read on `tombstones/*` (the mint's
+  pre-check and re-check); the key-delivery read path (model B's
+  endpoint, and `KeyStore` reads generally) holds LIST/`GetObject` on
+  `keys/*` plus read on `tombstones/*` — this worker, not the
+  event-ciphertext reader, is the principal that enumerates keys; the
+  shred initiator reads and writes
   `tombstones/*`. The sweeper's grants are wider than "it deletes":
   LIST/`GetObject` on `keys/*` (enumeration), read **and write** on
   `tombstones/*` — the step-3 commit CAS, the crashed-cancellation
@@ -260,12 +265,16 @@ exists to close. A tombstone object, once created, is never deleted.
    - `pending`: a shred is already in flight — CAS-**refresh** the
      body with this intent's audit position, keeping the existing
      timestamp (the subject is already soft-deleted; the earlier
-     clock only brings hard delete sooner). The stamp is
-     load-bearing, not bookkeeping: the tombstone must always name
-     the newest open intent, or the sweeper's reconciliation of a
-     *prior* intent's crashed cancellation (see Shred sweeper) would
-     match the stale stamp and flip this tombstone back to
-     `cancelled` — a live window under an open erasure intent.
+     clock only brings hard delete sooner). The refresh is
+     **forward-only**: CAS only if this intent's position is newer
+     than the one stamped. An initiator's own intent always is — but
+     the sweeper runs step 2 on behalf of *every* open intent, and
+     repairing an older one must never regress the stamp past a newer
+     one. The stamp is load-bearing, not bookkeeping: cancellation is
+     per-intent and CASes the tombstone only when the stamp names the
+     intent being closed (see Cancellation), so a stale or regressed
+     stamp would let a prior intent's cancellation flip this tombstone
+     back to `cancelled` — a live window under an open erasure intent.
    - `committing`: the commit point has passed and the state is
      terminal — proceed, the remaining steps are idempotent.
    - `cancelled`: a prior shred was reversed — reopen with a CAS
@@ -316,7 +325,11 @@ Three rules make the tombstone airtight rather than advisory:
   append's step-4 chunk verification): read the tombstone (must be
   absent or `cancelled`), `PUT` the generation (`If-None-Match: *`),
   read the tombstone again — if a soft-deleted state appeared, **fail
-  the mint** with a typed error. Deliberately no delete step: minters
+  the mint** with a typed error. Both tombstone reads are direct,
+  uncached GETs — S3's strong read-after-write consistency is what "a
+  pre-check after the tombstone is durable never PUTs" rests on;
+  routing them through the append path's negative cache would stretch
+  step 4's finite-strays argument by a full TTL. Deliberately no delete step: minters
   hold no `DeleteObject` (see Key-bucket layout) — that abstinence is
   what makes the one-deleting-principal claim in step 3 strict rather
   than aspirational. The stray a failed mint leaves is inert: the
@@ -337,9 +350,16 @@ Three rules make the tombstone airtight rather than advisory:
   failed re-check) is therefore inert — it decrypts nothing pre-shred
   (generations only move forward) and is never delivered — and gets
   deleted as hygiene whenever a sweep next observes it, **but only
-  under a soft-deleted tombstone** (`pending`/`committing`): under
-  `cancelled` a stray is indistinguishable from a real generation, and
-  deleting it would itself be erasure. Accepted residual: a stray
+  under `committing`**: there the hard delete has already emptied the
+  prefix, so every surviving object is a stray by definition. Under
+  `pending` and `cancelled` alike a stray is indistinguishable from a
+  real generation — the tombstone carries no generation watermark —
+  so a hygiene delete would risk destroying real keys before the
+  commit point (under `pending`, silently hollowing out what
+  cancellation is supposed to recover) or would itself be erasure
+  (under `cancelled`). Strays under `pending` simply wait, inert:
+  step 3's enumeration deletes them with everything else, or
+  cancellation strands them as the residual below. Accepted residual: a stray
   minted during a shred that is later cancelled becomes a permanent
   unused generation — unaudited, never used to encrypt, keyring noise
   only. (Having the failed mint delete its own stray would merely narrow
@@ -526,12 +546,22 @@ Overlapping runs can double-append `ShredCompleted` (the deletes are
 idempotent; the audit append is not) — accepted: the scan closes
 intents at the first, and a duplicate is noise, not a state change.
 One reconciliation rule joins the scan: an intent closed by
-`ShredCancelled` whose tombstone still reads `pending` — matched by the
-audit position recorded in the tombstone body, which step 2's refresh
-keeps pointing at the newest open intent, so a stale scan can never
-touch a newer intent's tombstone — is a cancellation that crashed
-between its append and its CAS; the sweeper completes the
-`pending → cancelled` transition on its behalf. If that CAS 412s against
+`ShredCancelled` whose tombstone still reads `pending` is a
+cancellation that crashed between its append and its CAS; the sweeper
+completes the `pending → cancelled` transition on its behalf — under
+two guards, both required. The tombstone's stamp must match the closed
+intent's audit position (step 2's forward-only refresh keeps the stamp
+at the newest open intent, so a stale scan cannot flip a tombstone a
+newer intent has claimed), **and the same scan must show zero open
+intents for the subject** — the stamp alone is not enough, because a
+newer intent that has appended `ShredRequested` (step 1) but not yet
+stamped the tombstone (step 2) is invisible to it, and flipping to
+`cancelled` under that open intent would open a live window the
+sweeper itself would only later re-close. One residual survives the
+guards — an intent appended after the scan's read whose initiator
+crashes before step 2 is invisible to both — and heals the same way
+every crash here does: the next run sees the open intent and reopens
+the tombstone via step 2 on its behalf. If that CAS 412s against
 `committing`, a mid-flight sweep had already won the commit point before
 the cancellation was appended; the audit trail then truthfully reads
 Cancelled-then-Completed — the cancellation was requested, and it lost.
