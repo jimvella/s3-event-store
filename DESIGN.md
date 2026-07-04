@@ -67,7 +67,8 @@ application objects can live as siblings under the same prefix
 Two rules: nothing else may write below `{prefix}/streams/` (a foreign
 object under `e/` would be parsed as a commit by head discovery), and
 `streamId` contains no slashes — namespacing lives in the prefix, identity
-in the id. Prefixes follow the same no-PII rule as stream IDs (see Erasure).
+in the id. Prefixes follow the same no-PII rule as stream IDs (see the
+Encryption & erasure contract).
 
 **Append protocol**
 
@@ -90,8 +91,15 @@ in the id. Prefixes follow the same no-PII rule as stream IDs (see Erasure).
    surfaces as `ConcurrencyError` — the caller re-reads, sees its own events,
    and may double-append.) If the GET 404s, the key was compacted since the
    412 — fetch the bucket's chunk and compare `commitId` there instead.
-   Otherwise another writer won → raise `ConcurrencyError` (caller retries:
-   re-read, re-decide, re-append).
+   A foreign `commitId` at the key is **not yet** proof we lost: check the
+   bucket's chunk for our `commitId` too before giving up — our original
+   PUT may have succeeded, been compacted, and had its freed key recreated
+   by a stalled writer's orphan, in which case the object at the key is the
+   orphan and our commit lives in the chunk. In the common lost-race case
+   the bucket is the unsealed tail with no chunk, so this extra check is
+   one fast 404. Only when neither the key nor its bucket's chunk carries
+   our `commitId` did another writer win → raise `ConcurrencyError`
+   (caller retries: re-read, re-decide, re-append).
 4. On success, **verify the target bucket has no chunk**: GET
    `c/{⌊v/N⌋·N}` for the version v just written. 404 — the overwhelmingly
    common case — confirms the append. An existing chunk that lacks our
@@ -316,7 +324,10 @@ N; the cap also keeps REST page assembly cheap.
    ≥ (k+1)·N exists). Bases progress densely, so the bucket is then
    **sealed** — it can never gain another commit — and it sits behind the hot
    tail where appends and head-hint readers operate. The lag is structural,
-   not clock-based.
+   not clock-based. Selection is always the **lowest** sealed uncompacted
+   bucket, keeping chunk keys dense up to the watermark — an invariant, not
+   a scheduling accident: the sealed-bucket read rule's "only the first
+   sealed bucket needs the check" argument fails if a compactor skips ahead.
 3. GET the bucket's commits, write one chunk object with `If-None-Match: *`.
    A 404 on a source commit mid-GET means a racing winner is already
    deleting sources; its chunk necessarily exists (chunk PUT strictly
@@ -483,134 +494,28 @@ the deployment wires them into its append/read handlers (or the queue).
   conditional writes; trade-off is one-AZ durability and directory-bucket LIST
   semantics — offer as an opt-in backend behind the same interface.
 
-## Erasure: crypto-shredding and field-level encryption
+## Encryption & erasure contract
 
-Physical deletion is a poor fit for an immutable store (versioned buckets,
-backups, replicas, caches, and downstream projections all retain copies).
-The supported erasure strategy is **crypto-shredding**: encrypt data client-side
-with a per-stream or per-user data key before writing; erasure = deleting the
-key. Every copy everywhere becomes unreadable at once.
+Client-side encryption, key management, and GDPR erasure are specified in a
+companion document, [KEYS_DESIGN.md](KEYS_DESIGN.md). The split works because the
+dependency is one-way: that layer builds on core invariants, and the core
+never depends on encryption existing — an unencrypted store is fully
+specified by this document alone. What KEYS_DESIGN.md builds on, guaranteed here:
 
-This ships as an encrypting **serializer** (envelope encryption: data keys
-wrapped by a master key, pluggable key-store interface — AWS KMS as one
-implementation, not assumed, since R2 has no KMS). Two design notes that are
-easy to get wrong:
-
-- **Shred propagation delay = key-cache TTL.** Readers cache unwrapped data
-  keys in-process; a shredded key remains usable until caches expire. Bound
-  and document the TTL (GDPR's ~30-day window makes minutes/hours fine).
-  Edge plaintext caches and client-delivered keys join the same budget —
-  shred delay = the max of all such TTLs (see Serverless deployment).
-- **Key loss is total data loss.** The key store is small but critical,
-  stateful infrastructure — the one exception to "no database besides S3."
-  (It can itself be S3 objects with versioning off, wrapped by a master key.)
-  Per-key deletion should be soft-delete-then-hard-delete with a waiting
-  period.
-
-### What GDPR actually requires
-
-GDPR is technology-neutral: Article 17 requires erasure "without undue delay"
-(≈ one month, via Article 12(3)'s response deadline), and regulators (EDPB,
-UK ICO, Danish DPA — the latter addressed crypto-shredding directly) accept
-**rendering data permanently irrecoverable** as erasure. For crypto-shredding
-to qualify, three obligations follow:
-
-1. **Key destruction must be total** — no copy of the key may survive in any
-   backup, replica, or cache. Demonstrating this is the compliance story; the
-   key store's *configuration* matters more than its technology.
-2. **State-of-the-art crypto** (Article 32) — AES-256-GCM qualifies; a
-   breakable cipher means the data was never erased.
-3. **Anything outside the encryption boundary is still personal data** —
-   envelope metadata and stream IDs remain subject to erasure on their own.
-   Never derive `streamId` from PII (no `user-jane@example.com`); use opaque
-   IDs and document this loudly.
-
-Key-cache TTL (above) bounds shred propagation; keep it well inside the
-one-month window and document the number.
-
-### Key store as a separate S3 bucket
-
-A dedicated bucket for wrapped keys is acceptable to regulators and keeps the
-"only S3" story intact — but it needs the **inverted configuration** from the
-event bucket, which is precisely why it must be a separate bucket (these are
-all bucket-level settings, on for events, off for keys):
-
-- **Versioning off** — a versioned delete is just a delete marker; the key
-  would remain readable via old versions.
-- **No Object Lock** — erasure requires the ability to delete.
-- **No replication** — S3 replication does not propagate permanent deletions;
-  a replica would silently retain shredded keys forever.
-- **No backups that outlive the erasure deadline** — either rely on S3's
-  11-nines durability with no backups, or cap backup retention below ~30 days
-  so shredded keys age out before the compliance clock expires. Accidental-
-  deletion protection comes from the soft-delete waiting period, not backups.
-- **Keys stored wrapped** by a master key (AWS KMS, or a configured secret on
-  R2, which has no KMS) — a bucket leak then discloses nothing.
-- **Strict IAM separation + audit logging** — ideally a separate account; the
-  principal that reads event ciphertext must not enumerate keys, and key
-  deletions need an audit trail you can show a regulator.
-
-**Decision**: a dedicated bucket (as configured above) is the **default
-key-store backend**. The library defines the `KeyStore` interface, ships the
-S3-bucket implementation as the default, and verifies the settings above at
-startup (fail fast if the key bucket has versioning or replication enabled).
-KMS- or DynamoDB-backed stores remain possible via the interface but are not
-shipped in v1.
-
-### Key audit trail
-
-Three layers with distinct jobs — don't collapse them:
-
-| Layer | Role | Why |
-|-------|------|-----|
-| Mutable key objects (key bucket) | **State** | Keys must be truly deletable — the one requirement antithetical to event sourcing. A key "aggregate" would embed wrapped key material in immutable events; shredding would then mean rewriting history. Key state is therefore never event-sourced. |
-| CloudTrail data events on the key bucket | **Evidence** | The regulator-facing trail must be independent of library correctness: captured by the platform regardless of what our code does, tamper-evident, IAM-separated by construction. A self-written trail, stored in a bucket where the compactor holds delete rights, proves little. (R2 caveat: Cloudflare audit logs are less granular — document this as a compliance gap to assess per deployment.) |
-| `$system/key-audit` event stream | **Observability** | An ordinary stream in the event store recording key lifecycle (`KeyCreated`, `ShredRequested`, `ShredCompleted`) so existing read/projection tooling answers "all shreds last quarter" for free. A convenience projection of key lifecycle, not the compliance record. |
-
-Rules for the audit stream:
-
-1. **No key material, ever** — key IDs, timestamps, actor, reason only.
-2. **Opaque subject identifiers only.** Proof-of-erasure records are lawful to
-   retain (Article 17(3) legal-obligation carve-out) — but only if the subject
-   reference is an opaque ID. A PII-bearing audit record would itself need
-   shredding, recording which… is a circle.
-3. **Plaintext payloads.** No PII → nothing to shred → no dependency on the
-   key store it is auditing.
-
-Shred is a dual write (delete key object + append audit events), so order it
-intent-first: append `ShredRequested` → delete key → append `ShredCompleted`.
-A crash leaves a visible dangling intent — never a silent, unaudited shred —
-and a sweeper can resume incomplete shreds by scanning for unmatched intents.
-
-### Whole-payload vs. field-level encryption
-
-**Whole-payload** (encrypt the entire `data` blob; envelope metadata stays
-plaintext) is the v1 choice:
-
-- Simple and uniform — no schema knowledge needed; impossible to "forget a
-  field."
-- Fixed overhead: one nonce + auth tag (~28 bytes) per event; compress before
-  encrypting (ciphertext doesn't compress).
-- Cost: payloads are opaque to the S3 console, grep, Athena/S3 Select — all
-  debugging goes through the library.
-
-**Field-level** (encrypt only annotated personal-data fields) is a possible v2
-refinement. Trade-offs:
-
-| | Pro | Con |
-|---|---|---|
-| Observability | Non-PII fields (types, amounts, references) stay queryable/greppable | — |
-| Shred surface | Only what compliance requires becomes unreadable; replays of shredded streams keep their business meaning | — |
-| Schema coupling | — | Needs a per-event-type annotation mechanism (field paths / decorators); upcasters must understand encrypted fields; nested and dynamic shapes are awkward |
-| Failure mode | — | Forgetting to annotate a field silently leaks plaintext PII forever (immutable!). Default must be fail-closed: unannotated event types get whole-payload encryption, opting *out* is explicit |
-| Size overhead | — | ~28 bytes + base64 inflation (+33%) **per field** — many small fields cost proportionally more than one whole-payload envelope |
-| Key mapping | Per-user keys become natural (each field tagged with its data subject) | Requires resolving field → data-subject → key at write time |
-| Queryability temptation | — | Equality search over encrypted fields requires deterministic encryption, which leaks equality patterns; refuse this in the library, punt to projections |
-
-**Decision**: the core library defines the serializer interface from day one;
-the whole-payload encrypting serializer + key store ship in roadmap phase 3.
-Field-level is phase 5 with fail-closed defaults, only if real demand shows
-up — it's the kind of API that's expensive to get wrong.
+1. **Serializer interface.** Encryption ships as a pluggable serializer
+   (compress, then encrypt); the store treats payloads as opaque bytes.
+2. **`keyId` is a reserved envelope field** — opaque, plaintext, outside
+   the encryption boundary, inside the envelope compaction copies.
+3. **Compaction copies payload bytes verbatim** (see Interactions under
+   Compaction) — chunking never re-serializes, so it needs no key access.
+4. **No PII in stream IDs or prefixes** — identifiers live forever in keys,
+   hints, and audit records, outside any encryption boundary.
+5. **Immutability and no-purge edge caching are permanent facts** — the
+   crypto layer must work with ciphertext that can never be rewritten or
+   reliably purged (this is what forces KEYS_DESIGN.md's generational rotation).
+6. **Every cache declares a bounded TTL** — worker key caches, model-A
+   plaintext edge entries, client keyrings — feeding KEYS_DESIGN.md's unified
+   shred-propagation budget.
 
 ## Serverless deployment (Workers + R2)
 
@@ -647,8 +552,14 @@ for untrusted callers.
   cacheable — the price of the query shape, not a virtue. Few cross-stream
   queries ⇒ few projections.
 - Caveat: serving raw events makes **event schemas a public API contract** —
-  schema changes become breaking client changes, and upcasting must run
-  client-side or be applied by the worker on egress. Adopt deliberately.
+  schema changes become breaking client changes. Upcasting placement follows
+  cache lifetime: a cache-forever page pins whatever bytes rendered it (the
+  same no-purge edge-cache fact that rules out re-encrypting history), so
+  **egress upcasting is restricted to bounded-TTL paths** — model A, where
+  every response a client sees expires and a redeployed upcaster propagates
+  within the TTL. Paths serving immutable pages (unencrypted, model B)
+  return stored bytes verbatim and upcast client-side — head page included,
+  so one replay never mixes transformed and raw shapes. Adopt deliberately.
 
 **Two read models for encrypted streams** (they compose per-caller):
 
@@ -667,28 +578,17 @@ cache model-A plaintext under the bare request URL.
 
 Notes on model B:
 
-- A delivered key's TTL is an **authorization window, not disclosure
-  control** — a misbehaving client can retain keys or plaintext forever (as
-  it could retain plaintext under model A). GDPR erasure covers *our*
-  systems; Article 17(2)'s inform-recipients duty can be driven from the
-  `$system/key-audit` stream.
 - Keep ciphertext access-controlled, not public-but-encrypted: a leaked key
   or a future cipher break must not expose a stream's history to the world.
   The auth check is the worker request already being paid.
-- **Key rotation needs design before model B ships** (open question below).
-  "Until rotation" above is load-bearing for the authorization story, and
-  the two candidate semantics pull against different promises already
-  made: rotating for future events only (old readers keep the past; new
-  readers need both keys) preserves cache-forever ciphertext pages and
-  compaction's verbatim-copy rule; re-encrypting history breaks both.
-  Future-only is the likely answer, but it changes the key-delivery
-  endpoint's shape (multiple keys per stream), so decide and document it
-  before that endpoint exists.
+- The key half — keyring delivery, generational rotation,
+  TTL-as-authorization-window semantics — is specified in
+  [KEYS_DESIGN.md](KEYS_DESIGN.md) under Key delivery.
 
-**Shred propagation rule (unified):** shred delay = the **maximum of all
-plaintext- and key-cache TTLs** — worker key caches, edge plaintext TTLs
-(model A), client-delivered key TTLs (model B). One documented number, well
-inside the ~30-day erasure window.
+**Shred propagation:** every cache this deployment introduces — worker key
+caches, model-A plaintext edge entries, client-delivered keyrings — must
+declare a bounded TTL; those TTLs feed the unified shred-delay budget in
+[KEYS_DESIGN.md](KEYS_DESIGN.md) (Shred propagation rule).
 
 **Storage drivers.** Workers access R2 via native bindings
 (`env.BUCKET.put(key, val, { onlyIf })`) — no request signing, no SDK weight.
@@ -716,8 +616,9 @@ phase 4); nothing below needs rework when they arrive.
 **1. Core library (the npm package)** — the only shipped software. Storage
 drivers, event store (append/read), repository helper, serializers
 (incl. the encrypting one), `KeyStore` interface + S3-bucket implementation,
-`compactStream()` + trigger check, shred workflow helpers. A dependency,
-never a service — it owns no process.
+`compactStream()` + trigger check, shred workflow helpers (crypto and
+erasure behavior: [KEYS_DESIGN.md](KEYS_DESIGN.md)). A dependency, never a service — it
+owns no process.
 
 **2. Application worker (deployment code)** — thin HTTP handlers over the
 library:
@@ -731,14 +632,11 @@ The library ships no routes — auth and invariants are domain concerns.
 (A Hono-style middleware helper is a possible later convenience export.)
 
 **3. Background jobs** — with compaction write-driven, exactly one
-clock-driven job remains: the **shred sweeper** (cron; scans
-`$system/key-audit` for unmatched `ShredRequested` intents and resumes them).
-It legitimately needs a clock: a crashed shred has no guaranteed future write
-or read to revisit it, and erasure correctness has a deadline. It
-checkpoints like any catch-up reader (a cursor object, CAS-updated),
-carrying still-open intents forward in its checkpoint state — each run
-scans only audit events since the last, never the whole stream. One
-sweeper per store: each prefix has its own `$system/key-audit` stream.
+clock-driven job remains: the **shred sweeper** (cron). It legitimately
+needs a clock: a crashed shred has no guaranteed future write or read to
+revisit it, and erasure correctness has a deadline. Mechanics — resumable
+intents, checkpointing, one sweeper per store — in [KEYS_DESIGN.md](KEYS_DESIGN.md)
+under Shred sweeper.
 
 **4. Client** —
 
@@ -746,10 +644,13 @@ sweeper per store: each prefix has its own `$system/key-audit` stream.
   browser/edge caching free via `ETag` + `Cache-Control: immutable`. Any
   `fetch` loop with a cursor is a complete client.
 - *Model B:* thin browser SDK as subpath export **`./client`** — zero
-  dependencies, WebCrypto only. Responsibilities: fetch/cache the data key
-  respecting its TTL, AES-GCM decrypt (fail closed — a shredded stream
-  presents as decryption failure), cursor iteration, optional fold-to-state
-  helper. It exists for crypto correctness, not protocol: the REST API
+  dependencies, WebCrypto only. Responsibilities: fetch/cache the keyring
+  respecting its TTLs, pick the key per event by the envelope's `keyId`,
+  AES-GCM decrypt (fail closed — a shredded stream
+  presents as decryption failure; keyring semantics per
+  [KEYS_DESIGN.md](KEYS_DESIGN.md)), cursor iteration, caller-supplied
+  upcasters (client-side is the only upcasting on immutable paths — see
+  Query shape), optional fold-to-state helper. It exists for crypto correctness, not protocol: the REST API
   remains the contract and the SDK is its reference consumer.
 
 **5. Infrastructure (config, not code):** event bucket; key bucket (inverted
@@ -764,7 +665,7 @@ commands rather than raw append):
 POST /{prefix...}/streams/{id}/append         command endpoint; validated events in, AppendResult out
 GET  /{prefix...}/streams/{id}/events?from=v  events (A) or ciphertext envelopes (B), + next cursor
 GET  /{prefix...}/streams/{id}/head           current version — the poll target
-GET  /{prefix...}/streams/{id}/key            data key + TTL              (model B only)
+GET  /{prefix...}/streams/{id}/key            keyring: data keys + TTLs   (model B only)
 ```
 
 **Prefix routing.** `{prefix...}` is one or more path segments mapped
@@ -882,7 +783,7 @@ cached response is ever invalidated by compaction. Rules that make this hold:
      model-B ciphertext pages get `Cache-Control: immutable` and permanent
      edge-cache entries. Model-A plaintext pages are just as immutable but
      must be cached with **auth-scoped keys and a bounded TTL** that joins
-     the shred-propagation budget (see Serverless deployment) — immutability
+     the shred-propagation budget ([KEYS_DESIGN.md](KEYS_DESIGN.md)) — immutability
      is a property of the content, cache lifetime a property of the erasure
      story. After compaction a cache miss costs ~1–2 chunk GETs: pages
      align to event-version ranges while chunks bucket by *base*, so a
@@ -930,7 +831,7 @@ that's subscriptions/projections, phase 4.)
 | 0 | Scaffold: tsup, vitest, CI, key codec + envelope with 100% unit coverage |
 | 1 | Storage-driver interface + `r2-binding`/`aws-sdk`/`aws4fetch` drivers (incl. `onlyIf` conformance tests); `append`/`read` + optimistic concurrency + error taxonomy + **deterministic simulation harness** + integration tests |
 | 2 | Head hints, in-process head cache, repository helper, **compaction** (the replay mitigation, now snapshot-free) |
-| 3 | S3 Express backend, compression + whole-payload crypto-shredding serializer with pluggable key store, browser client SDK (`./client`) |
+| 3 | S3 Express backend, compression + whole-payload crypto-shredding serializer with pluggable key store (per [KEYS_DESIGN.md](KEYS_DESIGN.md)), browser client SDK (`./client`) |
 | 4 | Subscriptions: checkpointed catch-up + EventBridge/SQS adapter |
 | 5 | Field-level encryption (fail-closed defaults), if demand warrants |
 
@@ -942,10 +843,11 @@ that's subscriptions/projections, phase 4.)
    at N events per commit, which is what keeps bucket space dense (see
    Compaction).
 2. ~~Key-store choice~~ **Resolved**: a dedicated S3 bucket with wrapped keys
-   is the default backend (see Erasure section); alternatives via the
+   is the default backend (see [KEYS_DESIGN.md](KEYS_DESIGN.md)); alternatives via the
    `KeyStore` interface.
-3. **Model B key rotation — needs design before phase 3's client SDK.**
-   Future-events-only vs re-encrypt-history (see Serverless deployment):
-   future-only preserves immutable ciphertext caching and verbatim-copy
-   compaction, but makes the key endpoint deliver multiple keys per stream
-   and complicates "key = capability for the whole stream." Unresolved.
+3. ~~Model B key rotation~~ **Resolved**: generational, future-events-only
+   — rotation appends a key generation, events carry a plaintext `keyId`,
+   the key endpoint delivers a keyring, and re-encrypting history is
+   reframed as stream migration to a new prefix. Rotation revokes future
+   access only; retroactive protection is impossible in an immutable store
+   (see Key rotation in [KEYS_DESIGN.md](KEYS_DESIGN.md)).
