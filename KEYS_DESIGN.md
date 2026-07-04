@@ -88,11 +88,15 @@ all bucket-level settings, on for events, off for keys):
 - **No Object Lock** — erasure requires the ability to delete.
 - **No replication** — S3 replication does not propagate permanent deletions;
   a replica would silently retain shredded keys forever.
-- **No backups that outlive the erasure deadline** — either rely on S3's
-  11-nines durability with no backups, or cap backup retention below ~30 days
-  so shredded keys age out before the compliance clock expires. Accidental-
-  deletion protection comes from the tombstone waiting period (see Shred
-  protocol), not backups.
+- **No backups is the default** — rely on S3's 11-nines durability;
+  accidental-deletion protection comes from the tombstone waiting period
+  (see Shred protocol), not backups. If policy forces backups anyway,
+  retention is a term in the irrecoverability budget, not a free ~30 days:
+  the key object persists through the whole soft-delete waiting period, so
+  a backup taken the day before hard delete still holds the key for its
+  full retention — waiting period + sweep cadence + backup retention must
+  fit the deadline together (a 14-day wait leaves roughly two weeks for
+  retention; see Shred propagation rule).
 - **Keys stored wrapped** by a master key (AWS KMS, or a configured secret on
   R2, which has no KMS) — a bucket leak then discloses nothing.
 - **Strict IAM separation + audit logging** — ideally a separate account; the
@@ -131,9 +135,15 @@ tombstones/{subjectId}.json        # shred state machine (see Shred protocol)
   generation. The layout is what makes the shred protocol's listings
   well-defined.
 - The prefixes are also the IAM boundary: minters and rotation hold
-  `PutObject`/`GetObject` on `keys/*` only; the shred initiator writes
-  `tombstones/*`; `DeleteObject` on `keys/*` belongs to the sweeper's
-  principal alone (see the confinement note under Shred protocol).
+  `PutObject`/`GetObject` on `keys/*` plus read on `tombstones/*` (the
+  mint's pre-check and re-check); the shred initiator reads and writes
+  `tombstones/*`. The sweeper's grants are wider than "it deletes":
+  LIST/`GetObject` on `keys/*` (enumeration), read **and write** on
+  `tombstones/*` — the step-3 commit CAS, the crashed-cancellation
+  reconciliation, and step-2 creation for a crashed initiator are all
+  sweeper writes, so under-granting here breaks the commit point — and,
+  alone among principals, `DeleteObject` on `keys/*` (see the
+  confinement note under Shred protocol).
 
 ## Key rotation
 
@@ -211,7 +221,10 @@ Rules for the audit stream:
    scope. (b) In the window before mapping deletion, retaining the
    minimal record (opaque ID, keyIds, timestamps, actor — no attributes)
    is what the Article 17(3)(b) carve-out covers, with data minimization
-   as the discipline.
+   as the discipline. The same discipline covers **`actor`**: an
+   operator's email in a plaintext immutable stream is the identical
+   circle one reference over — record an opaque principal ID (service
+   identity, IdP subject), with the mapping held outside the store.
 3. **Plaintext payloads.** No PII → nothing to shred → no dependency on the
    key store it is auditing.
 4. **Reserved name.** `$system.key-audit` sits in the `$`-reserved stream
@@ -239,25 +252,45 @@ exists to close. A tombstone object, once created, is never deleted.
 
 1. Append `ShredRequested` to `$system.key-audit`.
 2. Write the per-subject **tombstone** in the key bucket, state
-   `pending` (`If-None-Match: *`). If one already exists, read it:
-   `pending` or `committing` means a shred is already in flight —
-   proceed, the remaining steps are idempotent; `cancelled` means a
-   prior shred was reversed — reopen it with a CAS
-   `cancelled → pending`. Contents: opaque subject ID, state,
-   timestamp, the intent's audit-stream position, no key material —
-   lawful to retain under Article 17(3), and the fail-closed signal
-   that this subject may never silently re-key. **The tombstone is the
-   soft delete**: keyring reads, key delivery, and appends fail closed
-   immediately (unreadability propagates within the cache-TTL budget),
-   while the generations stay physically in place — recoverable only by
-   audited cancellation (below) — and the tombstone's timestamp starts
-   the waiting period.
+   `pending` (`If-None-Match: *`). Contents: opaque subject ID, state,
+   timestamp, the owning intent's audit-stream position, no key
+   material — lawful to retain under Article 17(3), and the fail-closed
+   signal that this subject may never silently re-key. If one already
+   exists, read it and take it over by state — never adopt it as found:
+   - `pending`: a shred is already in flight — CAS-**refresh** the
+     body with this intent's audit position, keeping the existing
+     timestamp (the subject is already soft-deleted; the earlier
+     clock only brings hard delete sooner). The stamp is
+     load-bearing, not bookkeeping: the tombstone must always name
+     the newest open intent, or the sweeper's reconciliation of a
+     *prior* intent's crashed cancellation (see Shred sweeper) would
+     match the stale stamp and flip this tombstone back to
+     `cancelled` — a live window under an open erasure intent.
+   - `committing`: the commit point has passed and the state is
+     terminal — proceed, the remaining steps are idempotent.
+   - `cancelled`: a prior shred was reversed — reopen with a CAS
+     `cancelled → pending` that rewrites the **full body**: this
+     intent's position and a **fresh timestamp**. The subject was
+     live until this reopen, so the waiting period restarts; flipping
+     `state` alone would inherit an expired clock and hand the next
+     sweep an immediate hard delete with zero cancellation window.
+
+   **The tombstone is the soft delete**: keyring reads, key delivery,
+   and appends fail closed immediately (unreadability propagates
+   within the cache-TTL budget), while the generations stay physically
+   in place — recoverable only by audited cancellation (below) — and
+   the tombstone's timestamp starts the waiting period.
 3. **After the waiting period** — executed by the sweeper, never by the
    initiating request — CAS the tombstone `pending → committing`. This
    is the **commit point**: cancellation and hard delete race for one
    CAS on one ETag, so exactly one wins. On 412, re-read — `cancelled`:
    the intent closed under us, stand down; `committing`: a concurrent
-   sweeper run won, proceed idempotently. Only after winning, enumerate
+   sweeper run won, proceed idempotently; `pending` under a new ETag:
+   step 2 refreshed or reopened the body underneath us — honor the
+   timestamp it now carries (a reopened tombstone restarted the waiting
+   period) and stand down until that period expires; retrying the CAS
+   blind would steal a fresh intent's cancellation window. Only after
+   winning, enumerate
    the subject's generations and delete them. This is the **hard
    delete**: the point of irrecoverability, where Article 17 is
    satisfied. A `committing` tombstone is never transitioned again — it
@@ -346,6 +379,16 @@ point, a shred can be reversed — deliberately, never silently: append
 leaves a cancelled-but-still-`pending` subject — visible, still
 unreadable, and completed by the sweeper's reconciliation rule (see
 Shred sweeper) — rather than an unaudited recovery or a silent re-key.
+Cancellation is also **per-intent**: `ShredCancelled` names the intent
+it closes, and the canceller CASes the tombstone only when the body's
+stamp is that intent's position. A body stamped by a newer intent
+means this one was superseded (step 2's refresh) — append the
+`ShredCancelled` regardless (it still closes its own intent in the
+audit), but leave the tombstone alone: the newer open intent keeps the
+subject soft-deleted. Recovering a subject therefore means cancelling
+**every** open intent, and the sweeper enforces that mechanically —
+while any intent stays open, it reopens whatever a partial
+cancellation flipped (step 2 on its behalf).
 Against the deadline, cancellation is not a fuzzy race but a decided
 one: once the waiting period expires the sweeper may CAS
 `pending → committing` at any moment, and whichever transition wins the
@@ -455,24 +498,37 @@ Two clocks, two budgets:
   (see the third tombstone rule), plus at most one in-flight append that
   lands doomed — erased by the shred like everything before it.
 - **Irrecoverability** (the clock Article 17 counts): soft-delete waiting
-  period + sweep cadence + retry slack, ending at the hard delete that
-  `ShredCompleted` records.
+  period + sweep cadence + retry slack — plus, if the key bucket is
+  backed up at all, **backup retention**: the key object persists until
+  the hard delete, so a backup taken just before it holds the key for
+  its full retention. The clock stops at the hard delete
+  `ShredCompleted` records, or at the expiry of the last backup
+  containing the key, whichever is later.
 
 Erasure is complete at the later of the two; keep the total well inside
 the ~30-day window (a 14-day waiting period, daily sweep, and hour-scale
-cache TTLs leave half the month as slack).
+cache TTLs leave half the month as slack — slack that key-bucket backup
+retention, if any exists, consumes first).
 
 ## Shred sweeper
 
 With compaction write-driven, this is the one clock-driven job in the
 system (cron): it scans `$system.key-audit` for open `ShredRequested`
-intents (no matching `ShredCompleted` or `ShredCancelled`) and drives each
-to completion — ensuring the tombstone exists (step 2, if the initiator
-crashed first), then executing hard delete and confirmation (steps 3–4)
-once the intent's waiting period expires; all idempotent under resume.
+intents (no closing `ShredCompleted` or `ShredCancelled`) and drives each
+to completion — ensuring the tombstone exists and is stamped with the
+intent (step 2, if the initiator crashed first), then executing hard
+delete and confirmation (steps 3–4) once the waiting period the
+tombstone carries expires; all idempotent under resume. Intent matching
+is asymmetric by design: `ShredCancelled` closes only the intent it
+names, while `ShredCompleted` closes **every** intent for its subject
+open at its append position — one hard delete satisfied them all.
+Overlapping runs can double-append `ShredCompleted` (the deletes are
+idempotent; the audit append is not) — accepted: the scan closes
+intents at the first, and a duplicate is noise, not a state change.
 One reconciliation rule joins the scan: an intent closed by
 `ShredCancelled` whose tombstone still reads `pending` — matched by the
-audit position recorded in the tombstone body, so a stale scan can never
+audit position recorded in the tombstone body, which step 2's refresh
+keeps pointing at the newest open intent, so a stale scan can never
 touch a newer intent's tombstone — is a cancellation that crashed
 between its append and its CAS; the sweeper completes the
 `pending → cancelled` transition on its behalf. If that CAS 412s against
