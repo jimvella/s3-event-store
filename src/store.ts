@@ -361,10 +361,25 @@ export function createEventStore(config: EventStoreConfig): EventStore {
     // Step 3: 412. GET the key we just targeted and compare commitId.
     const got = await driver.get(key);
     if (got.kind === "found") {
-      if (parseCommit(got.body).commitId === commit.commitId) return won(got.etag); // we already won
-      // A foreign commitId at the key is not yet proof we lost: our own
-      // commit may have been compacted and its freed key recreated.
-      if ((await chunkVerdict(streamId, baseVersion, commit.commitId)) === "ours") return won(null);
+      if (parseCommit(got.body).commitId === commit.commitId) {
+        // OUR commitId at the key is NOT yet proof we won: with the first
+        // PUT's response lost (nothing written — another writer held the
+        // key), a later retry can itself be the freed-key recreation after
+        // compaction. Same chunk verdict as step 4 disambiguates.
+        // (Found by the simulator's storage invariant, seed 641.)
+        switch (await chunkVerdict(streamId, baseVersion, commit.commitId)) {
+          case "no-chunk":
+            return won(got.etag); // live commit in an unchunked bucket: we won
+          case "ours":
+            return won(null); // compacted; the object at the key may be our orphan
+          case "foreign":
+            break; // our object at the key is a freed-key orphan: we lost
+        }
+      } else if ((await chunkVerdict(streamId, baseVersion, commit.commitId)) === "ours") {
+        // A foreign commitId at the key is not yet proof we lost: our own
+        // commit may have been compacted and its freed key recreated.
+        return won(null);
+      }
     } else {
       // Key compacted since the 412 — check the bucket's chunk instead.
       if ((await chunkVerdict(streamId, baseVersion, commit.commitId)) === "ours") return won(null);
@@ -462,7 +477,11 @@ export function createEventStore(config: EventStoreConfig): EventStore {
         return;
       }
     }
-    throw new CorruptionError(`read of ${streamId} could not reach a consistent listing`);
+    // Every retry means a compaction pass moved the stream under us —
+    // legal contention, not an impossible state. Retryable by the caller.
+    throw new TransientStoreError(
+      `read of ${streamId} kept losing compaction races; retry`,
+    );
   }
 
   /** One read attempt; false = lost a race with a compactor, retry. */

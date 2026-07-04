@@ -150,6 +150,69 @@ describe("lost response resolved through compaction (append step 3/4)", () => {
   });
 });
 
+describe("self-recreation at a freed key (append step 3, ours-at-key)", () => {
+  it("a retry that itself recreated the freed key is a conflict, not a win", async () => {
+    // Found by the simulator's storage invariant (sweep seed 641): writer A
+    // 412s against B's commit but the response is lost; compaction frees
+    // the key; A's retry *creates* — recreating its own commit as an orphan
+    // — and that response is lost too; A's final retry 412s against its own
+    // object. "Ours at the key" must then still run the chunk verdict.
+    const sim = new SimStore();
+    const setup = makeStore(directDriver(sim), "W");
+    await setup.append(STREAM, [{ type: "E", data: 0, id: "b0" }], { expectedVersion: "noStream" });
+    await setup.append(STREAM, [{ type: "E", data: 1, id: "b1" }], { expectedVersion: 0 });
+
+    // A resolves head=1 (targets e/2), then stalls; its first PUT attempt
+    // will land after compaction has freed the key, apply as a create, and
+    // lose its response.
+    let reach!: () => void;
+    let release!: () => void;
+    const reached = new Promise<void>((r) => (reach = r));
+    const released = new Promise<void>((r) => (release = r));
+    let calls = 0;
+    const inner = directDriver(sim);
+    const lossy: StorageDriver = {
+      ...inner,
+      putIfAbsent: async (key, body) => {
+        calls++;
+        if (calls === 1) {
+          reach();
+          await released;
+          const r = await inner.putIfAbsent(key, body);
+          if (r.kind !== "created") throw new Error("test setup: expected a freed key");
+          throw new TransientStoreError("response lost"); // orphan created, A unaware
+        }
+        return inner.putIfAbsent(key, body); // retry: 412 against our own orphan
+      },
+    };
+    const writerA = makeStore(lossy, "A");
+    const attempt = writerA.append(STREAM, [{ type: "E", data: "x", id: "A-ev" }], {
+      expectedVersion: 1,
+    });
+    attempt.catch(() => {});
+    await reached;
+
+    // B wins e/2 and beyond; compaction frees e/2 and e/3.
+    await setup.append(STREAM, [{ type: "E", data: 2, id: "b2" }], { expectedVersion: 1 });
+    await setup.append(STREAM, [{ type: "E", data: 3, id: "b3" }], { expectedVersion: 2 });
+    await setup.append(STREAM, [{ type: "E", data: 4, id: "b4" }], { expectedVersion: 3 });
+    await compact(sim, 0);
+    await compact(sim, 2);
+
+    release();
+    await expect(attempt).rejects.toThrow(ConcurrencyError);
+
+    // No phantom: A's event is unreadable; the stream and head are intact.
+    const replay = await collect(makeStore(directDriver(sim), "R").read(STREAM));
+    expect(replay.map((e) => e.id)).toEqual(["b0", "b1", "b2", "b3", "b4"]);
+    const head = await makeStore(directDriver(sim), "R2").resolveHead(STREAM);
+    expect(head).toMatchObject({ kind: "head", version: 4 });
+    // The orphan is sweep garbage, cleaned like any other.
+    const swept = await makeStore(directDriver(sim), "S").sweepStream(STREAM);
+    expect(swept.deleted).toBe(1);
+  });
+});
+
 describe("post-LIST substitution (pinned GET)", () => {
   it("a listed key compacted, freed, and recreated before its GET is caught by the etag pin", async () => {
     const sim = new SimStore();

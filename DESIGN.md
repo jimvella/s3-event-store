@@ -88,12 +88,22 @@ no-PII rule as stream IDs (see the Encryption & erasure contract).
    **N events** (the chunk size — see Compaction); larger atomic appends are
    rejected at the API.
 3. On HTTP 412: GET the key just targeted and compare `commitId`. If it is
-   ours, we already won — the original PUT succeeded but its response was
-   lost, and the transport-level retry collided with our own object; report
-   success. (Without this check, a retried conditional PUT is
-   indistinguishable from a lost race, and a timed-out-but-successful append
-   surfaces as `ConcurrencyError` — the caller re-reads, sees its own events,
-   and may double-append.) If the GET 404s, the key was compacted since the
+   ours, the usual cause is that the original PUT succeeded but its response
+   was lost, and the retry collided with our own object. (Without this
+   check, a retried conditional PUT is indistinguishable from a lost race,
+   and a timed-out-but-successful append surfaces as `ConcurrencyError` —
+   the caller re-reads, sees its own events, and may double-append.) But
+   **ours-at-the-key alone is not proof we won**: when the *first* PUT's
+   response was lost without the PUT applying (another writer held the key),
+   a later retry can land after compaction freed the key and itself be the
+   freed-key recreation — our own commit body, sitting as an orphan in a
+   chunked bucket, with the final retry 412ing against it. So ours-at-key
+   still runs the step-4 chunk check: no chunk for the bucket → we won;
+   chunk containing our `commitId` → we won (the object at the key may be
+   our orphan, but the chunk carries the commit); chunk without us → we
+   lost, and the object at the key is sweep garbage. (This branch was found
+   by the simulator's storage invariant, not the original analysis — a
+   double-lost-response schedule.) If the GET 404s, the key was compacted since the
    412 — fetch the bucket's chunk and compare `commitId` there instead.
    A foreign `commitId` at the key is **not yet** proof we lost: check the
    bucket's chunk for our `commitId` too before giving up — our original

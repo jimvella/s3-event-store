@@ -51,6 +51,14 @@ export class Oracle {
     return this.attempts.filter((a) => a.outcome === "committed").length;
   }
 
+  get rejectedCount(): number {
+    return this.attempts.filter((a) => a.outcome === "rejected").length;
+  }
+
+  get indefiniteCount(): number {
+    return this.attempts.filter((a) => a.outcome === "indefinite").length;
+  }
+
   /** Highest version any committed append reported for the stream; -1 if none. */
   maxCommittedVersion(streamId: string): number {
     let max = -1;

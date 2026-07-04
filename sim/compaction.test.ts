@@ -209,8 +209,13 @@ describe("randomized write-triggered compaction sweep", () => {
             });
           }
           ctx.spawn("reader", async (store) => {
-            await collect(store.read(STREAM));
-            await collect(store.read(STREAM));
+            try {
+              await collect(store.read(STREAM));
+              await collect(store.read(STREAM));
+            } catch (err) {
+              // Retry exhaustion under compaction churn is legal contention.
+              if (!(err instanceof TransientStoreError)) throw err;
+            }
           });
           ctx.spawn("sweeper", async (store) => {
             await store.sweepStream(STREAM);
