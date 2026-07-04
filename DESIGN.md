@@ -1000,9 +1000,31 @@ conceded honestly:
 **Other candidates, and why they don't overlap:**
 
 - *The pattern itself*: Oskar Dudycz published essentially this append
-  mechanism (versioned keys + `If-None-Match: *` + 412 retry) in Nov 2024
+  mechanism (versioned keys + `If-None-Match: *` + 412 retry) in 2024
   ([Architecture Weekly](https://www.architecture-weekly.com/p/using-s3-but-not-the-way-you-expected))
   — never implemented, including in his own Emmett (PG/Mongo/ESDB only).
+  Compared in detail (2026-07): same foundation (create-only PUT as
+  optimistic concurrency, immutable objects, notifications as doorbell,
+  request pricing as the governing cost), but the sketch predates
+  `If-Match` — it lists CAS as a missing wish-list feature, where this
+  design leans on it as the second load-bearing primitive (pinned GETs,
+  pinned anchors). Three divergences are fixes, not taste: latest-chunk
+  discovery there sorts LIST results by `LastModified` (no ordering
+  guarantee) vs. lexicographic keys + pinned anchors here; "412 ⇒
+  conflict" is treated as the version check, sound only while nothing is
+  deleted — its own chunk reconciliation deletes objects, minting the
+  freed-key hazard it never analyzes (the class head resolution,
+  `commitId`, and append step 4 exist for); and it suggests S3 Select,
+  closed to new AWS customers since mid-2024. One divergence is a
+  deliberate trade: it embeds `snapshot + events` in each chunk for O(1)
+  rehydration — rejected here because snapshots couple storage to fold
+  logic and schema versions and would force the compactor to decrypt,
+  breaking the verbatim-bytes rule [KEYS_DESIGN.md](KEYS_DESIGN.md)
+  depends on; callers wanting snapshots can CAS a `{state, version}`
+  object in their own prefix, outside the store's invariants. Its
+  lifecycle-tiering idea (cold chunks to Glacier) is noted under Cost:
+  at most Intelligent-Tiering, S3-only — Glacier-class retrieval would
+  break replay latency assumptions.
 - *Kafka-on-S3* (WarpStream, AutoMQ, Bufstream, Confluent Freight): all
   keep a metadata store or database in the write path; Kafka protocol has
   no conditional append. [Tansu](https://github.com/tansu-io/tansu) is the
