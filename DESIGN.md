@@ -954,6 +954,83 @@ approximate; document this explicitly. ("All events across the system in
 [T₁, T₂]" is the global-feed problem this design deliberately excludes —
 that's subscriptions/projections, phase 4.)
 
+## Alternatives & prior art
+
+Surveyed 2026-07 (registry sweeps, HN, GitHub; plus a code review of
+s2-lite). Two conclusions: the core mechanism is well-validated by
+production systems, and the specific product — a coordination-free
+event-sourcing **library** on a bare bucket — does not exist.
+
+**Nearest alternative: S2** ([s2.dev](https://s2.dev), plus the MIT-licensed
+self-hostable [s2-lite](https://github.com/s2-streamstore/s2/tree/main/lite)).
+The only product with real per-stream optimistic concurrency on object
+storage: `match_seq_num` is `expectedVersion`, fencing tokens add writer
+exclusion, appends ack only after the WAL flushes to the bucket. But the
+architecture is disjoint from this design's: s2-lite is a **stateful
+single-writer server** over SlateDB (an LSM whose SSTs live on the bucket).
+Sequence numbers are assigned by an in-memory per-stream actor; the bucket's
+conditional writes are used once, to fence a single live writer instance
+(SlateDB manifest CAS — startup sleeps a manifest-poll interval to fence out
+a predecessor), never per append. Consequences, each the inverse of a goal
+here: it cannot run on Workers (resident actor state); failover means
+booting a replacement process; records live inside LSM SSTs that compaction
+rewrites, so reads always go through the server and an immutable-URL
+edge-cached read surface is structurally unavailable; encryption is CSEK
+(caller sends raw key material per request, no key management — appends
+with a *different* key silently succeed, the inconsistency the `keyId`
+envelope field here prevents; no erasure workflow). What it does better,
+conceded honestly:
+
+- **Throughput economics.** WAL group-commit amortizes many appends across
+  many streams into one PUT per flush interval. This design's
+  one-conditional-PUT-per-commit has no amortization — above some
+  appends/sec per store, a log-structured server wins on both dollars and
+  latency ceiling. That boundary is out of scope by design: the trade buys
+  zero infrastructure and true multi-writer.
+- **Live tailing** (SSE with resume tokens) vs. polling `GET head` here;
+  the Durable Objects upgrade path covers this if it matters.
+- **Fencing tokens** as an application primitive (implemented as commands
+  in the log). Storage CAS makes them unnecessary for correctness here,
+  but designated-writer patterns could want them — implementable later as
+  an ordinary event type checked at append time.
+- A **deterministic simulation harness** (`sim/`: seed-replayable,
+  linearizability-checked, simulated object store) — prior art worth
+  reading before building the phase-1 harness; it validates the approach.
+
+**Other candidates, and why they don't overlap:**
+
+- *The pattern itself*: Oskar Dudycz published essentially this append
+  mechanism (versioned keys + `If-None-Match: *` + 412 retry) in Nov 2024
+  ([Architecture Weekly](https://www.architecture-weekly.com/p/using-s3-but-not-the-way-you-expected))
+  — never implemented, including in his own Emmett (PG/Mongo/ESDB only).
+- *Kafka-on-S3* (WarpStream, AutoMQ, Bufstream, Confluent Freight): all
+  keep a metadata store or database in the write path; Kafka protocol has
+  no conditional append. [Tansu](https://github.com/tansu-io/tansu) is the
+  interesting one — a stateless broker coordinating via S3 conditional PUT
+  (works on MinIO/Tigris) — but it's a broker binary with Kafka semantics.
+- *Workers-native experiments* (DurableStreams, semaflare, workers-es):
+  all serialize through Durable Objects, abandoning bucket portability —
+  the platform's default answer this design deliberately avoids.
+- *Established event stores* (KurrentDB, Axon, Marten, Equinox, Castore,
+  MessageDB, EventSourcingDB): every one requires a server process or a
+  database.
+- *Crypto-shredding as a feature*: AxonIQ's GDPR module (commercial, JVM)
+  and Patchlevel (PHP) only; never on an object-storage-primary store,
+  never in TypeScript/serverless.
+
+**Mechanism validation** (same primitive, different problems): Turbopuffer
+and Chroma's wal3 run concurrency control on S3 conditional writes in
+production; SlateDB adopted native CAS; Icechunk achieves serializable
+isolation on a bare bucket via one CAS'd root pointer; Terraform now does
+native S3 state locking. The Nov 2024
+[HN thread](https://news.ycombinator.com/item?id=42240678) on `If-Match`
+(524 points) is full of WALs, locks, and LSMs — no event store.
+
+**Net**: the empty niche is not "durable streams on a bucket" (s2-lite now
+occupies that as a server); it is expectedVersion event sourcing as a
+library — no resident process, multi-writer via bucket CAS, edge-cacheable
+replay, erasure built in. No two of those coexist in any product found.
+
 ## Roadmap
 
 | Phase | Scope |
