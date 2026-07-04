@@ -64,11 +64,15 @@ The library owns only the `streams/` subtree under `{prefix}` — every LIST
 it issues is scoped to `{prefix}/streams/{streamId}/e|c/` — so unrelated
 application objects can live as siblings under the same prefix
 (`app-x/streams/…` next to `app-x/attachments/…`) with zero interaction.
-Two rules: nothing else may write below `{prefix}/streams/` (a foreign
-object under `e/` would be parsed as a commit by head discovery), and
+Three rules: nothing else may write below `{prefix}/streams/` (a foreign
+object under `e/` would be parsed as a commit by head discovery);
 `streamId` contains no slashes — namespacing lives in the prefix, identity
-in the id. Prefixes follow the same no-PII rule as stream IDs (see the
-Encryption & erasure contract).
+in the id; and stream IDs beginning with `$` are **reserved for
+library-defined system streams** (currently
+[KEYS_DESIGN.md](KEYS_DESIGN.md)'s `$system.key-audit`) — ordinary stream
+mechanics, but appended only by library-internal writers, so the external
+surface must reject `$`-IDs (see Prefix routing). Prefixes follow the same
+no-PII rule as stream IDs (see the Encryption & erasure contract).
 
 **Append protocol**
 
@@ -313,7 +317,11 @@ write-triggered only (see Scheduling). `compactStream` therefore compacts
 would blow the budget in one shot; the state-derived trigger drains a
 backlog across subsequent appends, and the queue variant is the
 bulk-migration path. `waitUntil`'s post-response wall-clock allowance
-(~30 s) bounds the GET phase — comfortable for ~N parallel, I/O-bound GETs.
+(~30 s) bounds the GET phase. "Parallel" is really ~6-wide — Workers cap
+simultaneous open connections at 6 — so N = 500 GETs run as ~84 waves,
+roughly 4–5 s at typical R2 latencies: comfortable, but the connection
+width, not N, is the variable to re-check if chunk assembly ever nears
+the limit (verify whether R2 binding calls share the fetch cap).
 N is a store-level constant: chunk keys and REST page URLs derive from
 it, so changing it under existing data means a full recompaction — pick once,
 record it in store config. N bounds request count, not bytes: the compactor
@@ -335,17 +343,26 @@ N; the cap also keeps REST page assembly cheap.
    tail where appends and head-hint readers operate. The lag is structural,
    not clock-based. Selection is always the **lowest** sealed uncompacted
    bucket, keeping chunk keys dense up to the watermark — an invariant, not
-   a scheduling accident: the sealed-bucket read rule's "only the first
-   sealed bucket needs the check" argument fails if a compactor skips ahead.
+   a scheduling accident: the sealed-bucket read rule's single-check-on-404
+   argument fails if a compactor skips ahead.
 3. GET the bucket's commits, write one chunk object with `If-None-Match: *`.
    A 404 on a source commit mid-GET means a racing winner is already
    deleting sources; its chunk necessarily exists (chunk PUT strictly
    precedes deletes) — confirm the chunk and stand down.
 4. Only after the chunk PUT succeeds, batch-DELETE the source commit objects
    (`DeleteObjects` / the binding's array `delete` — one call, ≤1000 keys).
-5. Sweep: delete any commit whose baseVersion falls in an existing chunk's
-   bucket (garbage from a crash between 3 and 4, or a freed-key recreation
-   already rejected by append step 4).
+5. Sweep: delete garbage commits — leftovers of a crash between 3 and 4,
+   or freed-key recreations already rejected by append step 4. The scan
+   range is defined by the watermark, not by the bucket just compacted:
+   every `e/` key with base below `compactedTo` is garbage *by
+   definition* (chunks are dense up to the watermark), so the sweep is
+   "LIST `e/` from the stream start up to the watermark, delete
+   everything found." It must scan from the stream start, not from the
+   previous watermark — an arbitrarily stalled writer can recreate a
+   freed key in a bucket the watermark passed long ago. This is hygiene,
+   not correctness (readers seed their `e/` LIST from the last chunk's
+   anchor, so sub-watermark garbage is invisible to them); run it
+   occasionally (every M-th compaction), not per invocation.
 
 **Failure modes, all harmless:**
 
@@ -387,13 +404,30 @@ N; the cap also keeps REST page assembly cheap.
      it has no chunk.** An orphan in the listing implies its bucket's
      chunk predates the listing, which implies the bucket is *visibly*
      sealed in that same listing (sealing bucket *k* required a live
-     commit with base ≥ (k+1)·N, and the tail never empties). Chunks are
-     dense, so only the first sealed bucket past the reader's last known
-     chunk needs the check — one HEAD on `c/{k·N}`, issued **after** the
-     `e/` LIST it guards (before it, the chunk may not exist yet and the
-     check passes vacuously), paid only when the tail spans a bucket
-     boundary. If the chunk exists it is authoritative: discard that
-     bucket's `e/` commits and read the chunk.
+     commit with base ≥ (k+1)·N, and the tail never empties). The check
+     starts at the first sealed bucket past the reader's last known
+     chunk: one `get` on `c/{k·N}` — a fast 404 in the common case, and
+     on a hit the chunk body is needed anyway, which is why the driver
+     interface offers no HEAD — issued **after** the `e/` LIST it
+     guards (before it, the chunk may not exist yet and the check
+     passes vacuously), paid only when the tail spans a bucket
+     boundary. The two outcomes propagate differently, and the
+     difference is load-bearing:
+     - **404**: chunks are dense, so no later bucket has a chunk either
+       — no LIST-time orphan is possible anywhere in the tail, and this
+       single check clears every sealed bucket in the listing.
+     - **Hit**: the chunk is authoritative — discard that bucket's `e/`
+       commits and read the chunk — but it clears *only that bucket*.
+       The reader's last known chunk has advanced, so the rule
+       re-applies to the next sealed bucket (equivalently: a hit proves
+       the listing predates a compaction pass — re-LIST `c/` and
+       re-anchor the tail from the new last chunk). A single
+       non-iterated check re-opens the phantom: a compactor that chunks
+       buckets *k* and *k+1* between the reader's `c/` and `e/` LISTs,
+       with freed keys recreated in both, passes the bucket-*k* check
+       via the chunk and would hand bucket *k+1*'s orphans to a reader
+       that stopped checking — and the pinned GETs cannot catch them,
+       because LIST-time orphans carry the ETags the LIST reported.
   A bucket unsealed at LIST time can never hold a LIST-time orphan, so
   the hot tail — the common case — pays nothing beyond the ETags the
   LIST already returned. All three races resolve as retry latency, never
@@ -483,7 +517,10 @@ the deployment wires them into its append/read handlers (or the queue).
     append was rejected — the freed-key-orphan schedules the pinned-GET
     and sealed-bucket
     read rules exist for, including the post-LIST substitution where a
-    listed key is compacted, freed, and recreated before its GET), readers
+    listed key is compacted, freed, and recreated before its GET, and the
+    multi-bucket schedule where two buckets are chunked between a reader's
+    `c/` and `e/` LISTs with keys recreated in both — the case the
+    sealed-bucket check must *iterate* to catch), readers
     always observe a contiguous prefix.
     Most of this
     design's correctness lives in race windows an integration suite can
@@ -496,6 +533,12 @@ the deployment wires them into its append/read handlers (or the queue).
     Miniflare/`wrangler dev` R2 simulation is not a conformance substitute)
     for the concurrency race test: spawn N concurrent appenders, assert
     exactly one winner per version, no gaps, no duplicates.
+- **Observability**: the library exposes counters/hooks — `ConcurrencyError`
+  rate, compaction lag behind the watermark (sealed uncompacted buckets),
+  sweep garbage found, head-cache invalidations. The design's
+  accepted-cost arguments (the compaction gap, benign watermark
+  regression, occasional sweep) all assume someone can see when "bounded
+  waste" starts costing; these counters are that visibility.
 - **Lint/CI**: eslint + prettier, vitest, GitHub Actions, changesets for
   release management, provenance-signed npm publish.
 
@@ -515,7 +558,14 @@ the deployment wires them into its append/read handlers (or the queue).
   compaction is exactly the freed-key case it catches (a 412 forces
   re-resolution, a step-4 `ConcurrencyError` must invalidate the cache the
   same way, and stale-high cannot arise: the process only caches heads
-  it observed).
+  it observed). That last claim holds *within the protocol*; external
+  interference during process lifetime — a bucket restore, manual deletion
+  — can make an observed head stale-high and mint the orphan-past-a-gap
+  corruption with no failing check, the same class the hint's
+  derive-from-commit-body rule closes. The cache is deliberately exempt
+  from that hardening: process lifetime is short, and a restore under live
+  writers violates assumptions everywhere, not just here. Bound the cache
+  TTL if the asymmetry ever matters.
 - Long streams: reading 10k commits = 10k GETs. Mitigations, in order:
   background **compaction** into chunk objects (see Compaction protocol —
   with no snapshot layer it is the primary replay mitigation, hence early in
@@ -668,9 +718,10 @@ The library ships no routes — auth and invariants are domain concerns.
 **3. Background jobs** — with compaction write-driven, exactly one
 clock-driven job remains: the **shred sweeper** (cron). It legitimately
 needs a clock: a crashed shred has no guaranteed future write or read to
-revisit it, and erasure correctness has a deadline. Mechanics — resumable
-intents, checkpointing, one sweeper per store — in [KEYS_DESIGN.md](KEYS_DESIGN.md)
-under Shred sweeper.
+revisit it, the soft-delete waiting period needs a scheduler (every hard
+delete is sweeper-executed), and erasure correctness has a deadline.
+Mechanics — resumable intents, waiting period, checkpointing, one sweeper
+per store — in [KEYS_DESIGN.md](KEYS_DESIGN.md) under Shred sweeper.
 
 **4. Client** —
 
@@ -725,7 +776,10 @@ prefixes are simply distinct permanent cache entries. Rules:
    prefix like `app-x/streams/evil` would nest one store's owned subtree
    inside another's, violating the ownership rule (scoped LISTs happen to
    make it benign today, but the invariant should hold by construction, not
-   by accident). Normalize percent-encoding before the path↔key mapping,
+   by accident). Reject externally supplied stream IDs beginning with `$`
+   — the reserved system-stream namespace (`$system.key-audit`) is written
+   only by library-internal code (see the ownership rules in Key layout).
+   Normalize percent-encoding before the path↔key mapping,
    reject empty segments, and enforce S3's 1024-byte key limit against the
    longest key a request can produce (prefix + streamId +
    `/e/{12 digits}.json`).
@@ -734,8 +788,8 @@ Side benefit: authorization tends to align with application grouping, so the
 worker gets a natural hook for per-app policy — path-prefix middleware,
 outside the library.
 
-Live updates = polling `GET head` (one cheap LIST behind it, short-TTL
-cacheable). SSE/WebSocket via Durable Objects is an optional deployment
+Live updates = polling `GET head` (full head resolution behind it — hint
+GET + short LIST + one anchor GET — short-TTL cacheable). SSE/WebSocket via Durable Objects is an optional deployment
 upgrade the library stays out of.
 
 ### Wire format
@@ -871,11 +925,11 @@ that's subscriptions/projections, phase 4.)
 
 ## Open questions
 
-1. **Commit granularity**: always allow multi-event commits (chosen above), or
-   force one-event-per-object for dense keys? Multi-event is the right default
-   — atomic use-case appends are the whole point of `expectedVersion` — capped
-   at N events per commit, which is what keeps bucket space dense (see
-   Compaction).
+1. ~~Commit granularity~~ **Resolved**: multi-event commits, capped at N
+   events per commit — atomic use-case appends are the whole point of
+   `expectedVersion`, and the cap is what keeps bucket space dense (see
+   Compaction). One-event-per-object for dense keys was rejected; version
+   math comes from reading regardless, so dense keys buy nothing.
 2. ~~Key-store choice~~ **Resolved**: a dedicated S3 bucket with wrapped keys
    is the default backend (see [KEYS_DESIGN.md](KEYS_DESIGN.md)); alternatives via the
    `KeyStore` interface.

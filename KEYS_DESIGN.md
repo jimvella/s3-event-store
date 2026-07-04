@@ -30,8 +30,21 @@ easy to get wrong:
 - **Key loss is total data loss.** The key store is small but critical,
   stateful infrastructure — the one exception to "no database besides S3."
   (It can itself be S3 objects with versioning off, wrapped by a master key.)
-  Per-key deletion should be soft-delete-then-hard-delete with a waiting
-  period.
+  Per-key deletion is soft-delete-then-hard-delete: the shred tombstone is
+  the soft delete (instant unreadability), and hard deletion happens only
+  after a waiting period, driven by the sweeper (see Shred protocol).
+- **Erasure completeness is a data-modeling obligation.** Shredding a
+  subject deletes that subject's keys, so erasure reaches exactly the
+  streams encrypted under them — no further. Personal data written into a
+  stream keyed to a different subject (a customer's address inside an
+  order stream carrying the order's key) survives the customer's shred
+  untouched. The rule, as loud as the no-PII-identifier rule: **every
+  stream containing a subject's personal data must be encrypted under that
+  subject's key(s)** — which makes the key store's subject→key mapping the
+  authoritative map of where a subject's data lives, and is what makes the
+  shred protocol's "enumerate the subject's generations" complete. The
+  library cannot enforce this; it is an application contract, and a miss
+  silently voids the erasure guarantee for the leaked data.
 
 ## What GDPR actually requires
 
@@ -51,8 +64,10 @@ to qualify, three obligations follow:
    Never derive `streamId` from PII (no `user-jane@example.com`); use opaque
    IDs and document this loudly.
 
-Key-cache TTL (above) bounds shred propagation; keep it well inside the
-one-month window and document the number.
+Key-cache TTL (above) bounds shred propagation, but the Article 17 clock
+is satisfied only at **hard delete** — cache TTLs, the soft-delete waiting
+period, and the sweep cadence must fit inside the month together (see
+Shred propagation rule).
 
 ## Key store as a separate S3 bucket
 
@@ -69,7 +84,8 @@ all bucket-level settings, on for events, off for keys):
 - **No backups that outlive the erasure deadline** — either rely on S3's
   11-nines durability with no backups, or cap backup retention below ~30 days
   so shredded keys age out before the compliance clock expires. Accidental-
-  deletion protection comes from the soft-delete waiting period, not backups.
+  deletion protection comes from the tombstone waiting period (see Shred
+  protocol), not backups.
 - **Keys stored wrapped** by a master key (AWS KMS, or a configured secret on
   R2, which has no KMS) — a bucket leak then discloses nothing.
 - **Strict IAM separation + audit logging** — ideally a separate account; the
@@ -138,7 +154,7 @@ Three layers with distinct jobs — don't collapse them:
 |-------|------|-----|
 | Mutable key objects (key bucket) | **State** | Keys must be truly deletable — the one requirement antithetical to event sourcing. A key "aggregate" would embed wrapped key material in immutable events; shredding would then mean rewriting history. Key state is therefore never event-sourced. |
 | CloudTrail data events on the key bucket | **Evidence** | The regulator-facing trail must be independent of library correctness: captured by the platform regardless of what our code does, tamper-evident, IAM-separated by construction. A self-written trail, stored in a bucket where the compactor holds delete rights, proves little. (R2 caveat: Cloudflare audit logs are less granular — document this as a compliance gap to assess per deployment.) |
-| `$system/key-audit` event stream | **Observability** | An ordinary stream in the event store recording key lifecycle (`KeyCreated`, `KeyRotated`, `ShredRequested`, `ShredCompleted`) so existing read/projection tooling answers "all shreds last quarter" for free. A convenience projection of key lifecycle, not the compliance record. |
+| `$system.key-audit` event stream | **Observability** | An ordinary stream in the event store recording key lifecycle (`KeyCreated`, `KeyRotated`, `ShredRequested`, `ShredCancelled`, `ShredCompleted`) so existing read/projection tooling answers "all shreds last quarter" for free. A convenience projection of key lifecycle, not the compliance record. |
 
 Rules for the audit stream:
 
@@ -149,6 +165,11 @@ Rules for the audit stream:
    shredding, recording which… is a circle.
 3. **Plaintext payloads.** No PII → nothing to shred → no dependency on the
    key store it is auditing.
+4. **Reserved name.** `$system.key-audit` sits in the `$`-reserved stream
+   namespace (DESIGN.md's key-layout rules): slash-free like every stream
+   ID — namespacing lives in the prefix, hence one audit stream *per
+   prefix* — and appended only by library-internal writers (shred workflow,
+   rotation). The REST surface rejects externally supplied `$`-IDs.
 
 ## Shred protocol
 
@@ -158,15 +179,29 @@ a first generation. A bare enumerate-then-delete can append `ShredCompleted`
 while a freshly minted generation lives on. The protocol is intent-first
 and tombstone-guarded:
 
-1. Append `ShredRequested` to `$system/key-audit`.
+1. Append `ShredRequested` to `$system.key-audit`.
 2. Write a per-subject **tombstone** object in the key bucket
    (`If-None-Match: *`; an existing tombstone means a shred is already in
-   flight — proceed, the remaining steps are idempotent). The tombstone is
-   permanent: opaque subject ID, timestamp, no key material — lawful to
-   retain under Article 17(3), and the fail-closed signal that this
-   subject may never silently re-key.
-3. Enumerate the subject's generations and delete them.
-4. Re-list to confirm empty, then append `ShredCompleted`.
+   flight — proceed, the remaining steps are idempotent). The tombstone
+   is permanent once the shred commits — removable only by pre-deadline
+   audited cancellation (below): opaque subject ID, timestamp, no key
+   material — lawful to retain under Article 17(3), and the fail-closed
+   signal that this subject may never silently re-key. **The tombstone is the soft
+   delete**: keyring reads and key delivery go empty immediately
+   (unreadability propagates within the cache-TTL budget), while the
+   generations stay physically in place — recoverable only by audited
+   cancellation (below) — and the tombstone's timestamp starts the
+   waiting period.
+3. **After the waiting period** — executed by the sweeper, never by the
+   initiating request — enumerate the subject's generations and delete
+   them. This is the **hard delete**: the point of irrecoverability, where
+   Article 17 is satisfied. Hard-delete rights on the key bucket can be
+   confined to the sweeper's principal — one identity destroys long-lived
+   keys, and it only acts on an expired, audited intent.
+4. Re-list to confirm empty — if a crashed minter's stray landed
+   mid-shred the re-list is non-empty: delete it and re-list again
+   (terminates, because post-tombstone mints self-delete) — then append
+   `ShredCompleted`.
 
 Two rules make the tombstone airtight rather than advisory:
 
@@ -176,7 +211,12 @@ Two rules make the tombstone airtight rather than advisory:
   it appeared, delete the just-minted generation and fail the mint. A mint
   whose PUT landed before step 3's enumeration is deleted by it; one that
   landed after is self-deleting, because the tombstone was durable before
-  enumeration began and the re-check must observe it.
+  enumeration began and the re-check must observe it. Cancellation adds
+  one subtlety: because it can *remove* a tombstone, a tombstone-free
+  re-check might be observing a cancelled shred whose hard delete had
+  already begun and swept the mint away — so the re-check also confirms
+  the just-minted generation still exists (one HEAD); generation gone ⇒
+  fail the mint.
 - **Keyring reads treat the tombstone as authoritative.** The `KeyStore`
   read path and the key-delivery endpoint return an empty keyring for a
   tombstoned subject, whatever objects a crashed minter left behind. A
@@ -185,10 +225,25 @@ Two rules make the tombstone airtight rather than advisory:
   never delivered — and gets deleted as hygiene whenever a sweep next
   observes it.
 
+**Cancellation — the waiting period's purpose.** Until hard deletion
+begins, a shred can be reversed — deliberately, never silently: append
+`ShredCancelled` to `$system.key-audit`, *then* delete the tombstone.
+That order is fail-safe: a crash between the two leaves a
+cancelled-but-still-tombstoned subject — visible, still unreadable,
+resumable by re-running the tombstone delete — rather than an unaudited
+recovery or a silent re-key. Cancellation is best-effort against the
+deadline: once the waiting period expires the sweeper may begin step 3 at
+any moment, and a cancellation racing it can find generations already
+destroyed. Cancel well before the deadline, or treat the shred as
+committed.
+
 A crash anywhere leaves a visible dangling intent — never a silent,
-unaudited shred — and the sweeper resumes incomplete shreds by scanning for
-unmatched intents (see Shred sweeper below); steps 2–4 are idempotent under
-resume.
+unaudited shred. The initiating request performs only steps 1–2 (intent +
+instant unreadability); the sweeper owns everything after, resuming
+incomplete shreds and executing due hard deletes by scanning for open
+intents — a `ShredRequested` with neither `ShredCompleted` nor
+`ShredCancelled` (see Shred sweeper below). Steps 2–4 are idempotent
+under resume.
 
 ## Whole-payload vs. field-level encryption
 
@@ -238,7 +293,7 @@ its caching rules live there. The key half of model B lives here:
   control** — a misbehaving client can retain keys or plaintext forever (as
   it could retain plaintext under model A). GDPR erasure covers *our*
   systems; Article 17(2)'s inform-recipients duty can be driven from the
-  `$system/key-audit` stream.
+  `$system.key-audit` stream.
 - Keyring size grows by one entry per rotation and is unbounded in
   principle; at any sane rotation cadence it is noise. If a pathological
   cadence ever makes it matter, cap delivery to the generations spanning
@@ -246,20 +301,36 @@ its caching rules live there. The key half of model B lives here:
 
 ## Shred propagation rule
 
-Shred delay = the **maximum of all plaintext- and key-cache TTLs** — worker
-key caches, edge plaintext TTLs (model A), client-delivered keyring TTLs
-(model B). One documented number, well inside the ~30-day erasure window.
-DESIGN.md's contract obliges every cache the core and deployment introduce
-to declare a bounded TTL; this budget is where they land.
+Two clocks, two budgets:
+
+- **Unreadability** (starts at the tombstone): delay = the **maximum of
+  all plaintext- and key-cache TTLs** — worker key caches, edge plaintext
+  TTLs (model A), client-delivered keyring TTLs (model B). One documented
+  number. DESIGN.md's contract obliges every cache the core and
+  deployment introduce to declare a bounded TTL; this budget is where
+  they land.
+- **Irrecoverability** (the clock Article 17 counts): soft-delete waiting
+  period + sweep cadence + retry slack, ending at the hard delete that
+  `ShredCompleted` records.
+
+Erasure is complete at the later of the two; keep the total well inside
+the ~30-day window (a 14-day waiting period, daily sweep, and hour-scale
+cache TTLs leave half the month as slack).
 
 ## Shred sweeper
 
 With compaction write-driven, this is the one clock-driven job in the
-system (cron): it scans `$system/key-audit` for unmatched `ShredRequested`
-intents and resumes them (shred steps 2–4 are idempotent). It legitimately
-needs a clock: a crashed shred has no guaranteed future write or read to
-revisit it, and erasure correctness has a deadline. It checkpoints like any
+system (cron): it scans `$system.key-audit` for open `ShredRequested`
+intents (no matching `ShredCompleted` or `ShredCancelled`) and drives each
+to completion — ensuring the tombstone exists (step 2, if the initiator
+crashed first), then executing hard delete and confirmation (steps 3–4)
+once the intent's waiting period expires; all idempotent under resume.
+The clock is not incidental but the design: every hard delete is
+sweeper-executed, so the waiting period needs no scheduler beyond the job
+that already exists, and a crashed shred is just an open intent the next
+run picks up. Erasure correctness has a deadline, hence cron rather than
+opportunistic triggering. It checkpoints like any
 catch-up reader (a cursor object, CAS-updated), carrying still-open intents
 forward in its checkpoint state — each run scans only audit events since
 the last, never the whole stream. One sweeper per store: each prefix has
-its own `$system/key-audit` stream.
+its own `$system.key-audit` stream.
