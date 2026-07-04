@@ -95,11 +95,13 @@ in the id. Prefixes follow the same no-PII rule as stream IDs (see Erasure).
 4. On success, **verify the target bucket has no chunk**: GET
    `c/{⌊v/N⌋·N}` for the version v just written. 404 — the overwhelmingly
    common case — confirms the append. An existing chunk that lacks our
-   `commitId` means the PUT recreated a freed key: the events are invisible
-   to readers and the sweep will delete the object, so raise
-   `ConcurrencyError` (the orphan is sweep garbage, never corruption). A
-   chunk that *contains* our `commitId` is the lost-response case again:
-   report success.
+   `commitId` means the PUT recreated a freed key: the events are unreadable
+   — readers ignore commits in chunked buckets, and the sealed-bucket read
+   rule (see Compaction failure modes) keeps the orphan invisible even to
+   readers holding a pre-chunk `c/` listing — and the sweep will delete the
+   object, so raise `ConcurrencyError` (the orphan is sweep garbage, never
+   corruption). A chunk that *contains* our `commitId` is the lost-response
+   case again: report success.
 5. Best-effort update `head.json` (plain PUT, last-writer-wins; contents and
    the corroboration rule under Head discovery below).
 
@@ -174,10 +176,13 @@ come from reading, never from key arithmetic.
   would otherwise be accepted silently and mint the stale-high orphan
   corruption above. One HEAD makes hint corruption fail safe instead of
   fail corrupt. Usually 1 GET + 1 short LIST + 1 HEAD.
-- Cold path (no or invalidated hint): paginate LIST over the `e/` prefix
-  (1000 keys/page). A non-empty stream always has commits under `e/` — the
-  highest occupied bucket can never seal (sealing requires a successor
-  bucket to have started), so compaction never empties the tail.
+- Cold path (no or invalidated hint): LIST `c/` first and GET the last
+  chunk — its recorded last commit key seeds `StartAfter` for the `e/`
+  LIST, so the walk covers only the uncompacted tail rather than every
+  commit ever written. Then paginate LIST over `e/` (1000 keys/page). A
+  non-empty stream always has commits under `e/` — the highest occupied
+  bucket can never seal (sealing requires a successor bucket to have
+  started), so compaction never empties the tail.
 - If the conditional PUT 412s, the head moved — re-list from the hint and retry.
 
 **Read protocol**: LIST the `e/` prefix, GET each commit object, yield
@@ -296,9 +301,13 @@ bulk-migration path. `waitUntil`'s post-response wall-clock allowance
 N is a store-level constant: chunk keys and REST page URLs derive from
 it, so changing it under existing data means a full recompaction — pick once,
 record it in store config. N bounds request count, not bytes: the compactor
-buffers a whole bucket while assembling its chunk, so pair the N-event cap
-with a **per-commit byte cap** (store config, low single-digit MB) to keep
-chunks well under Workers' 128 MB memory limit and REST page assembly cheap.
+buffers a whole bucket while assembling its chunk, and a bucket can hold up
+to N commits (all single-event), so worst-case chunk size is N × the
+**per-commit byte cap**. The two caps are one constraint — **byteCap × N ≤
+compactor memory budget** — and must be picked together: against Workers'
+128 MB limit with assembly headroom, N = 500 implies a cap around
+128–256 KB per commit, not megabytes. Both live in store config alongside
+N; the cap also keeps REST page assembly cheap.
 
 **Compactor steps (per stream):**
 
@@ -336,15 +345,31 @@ chunks well under Workers' 128 MB memory limit and REST page assembly cheap.
   **verify contiguity as they yield**: each commit's base must equal the
   previous base plus the previous commit's event count (event versions are
   dense even though keys are not). A discontinuity means "compacted since
-  our `c/` LIST" — re-LIST `c/` and fill the gap from the new chunk. Both
-  races resolve as retry latency, never a silent gap.
+  our `c/` LIST" — re-LIST `c/` and fill the gap from the new chunk.
+- *Contiguous phantom (freed-key orphan)* → contiguity has one blind spot.
+  A stalled writer's recreation at a freed key (rejected by append step 4,
+  but the object persists until the sweep) sits at exactly the base where
+  the compacted bucket's first commit used to be. A reader whose `c/` LIST
+  predates that bucket's chunk and whose `e/` LIST lands after the source
+  deletes finds the orphan *filling* the discontinuity — and would yield
+  events whose writer was told they failed, in place of the real ones in
+  the chunk. Closing rule: **never yield tail commits from a sealed bucket
+  without confirming it has no chunk.** Bucket *k* is visibly sealed to
+  the reader when its own listing contains a commit with base ≥ (k+1)·N;
+  chunks are dense, so only the first sealed bucket past the reader's last
+  known chunk needs the check — one HEAD on `c/{k·N}`, paid only when the
+  tail spans a bucket boundary. If the chunk exists it is authoritative:
+  discard that bucket's `e/` commits and read the chunk. An unsealed
+  bucket can never be chunked, so the hot tail — the common case — pays
+  nothing. All three races resolve as retry latency, never a silent gap
+  or substitution.
 
 **Reader path with chunks:** LIST `c/` (few keys) → GET relevant chunks →
 LIST `e/` with `StartAfter` the last chunk's last commit key (recorded in the
 chunk body) → GET tail commits, ignoring any commit whose base falls in an
-existing chunk's bucket, verifying version contiguity throughout (see
-failure modes above). A 1M-event replay becomes ~2k chunk GETs plus a
-short tail.
+existing chunk's bucket, verifying version contiguity and the sealed-bucket
+rule throughout (see failure modes above). A 1M-event replay becomes ~2k
+chunk GETs plus a short tail.
 
 **Cost:** per chunk ≈ N GETs + 1 PUT + 1 batched DELETE. DELETEs are free
 on S3 and R2, so compaction runs at roughly a tenth of the original write
@@ -368,8 +393,10 @@ path that already runs:
   immediately, ~N I/O-bound GETs run in background time. The condition is
   **state-derived, not event-derived**: "a sealed bucket with uncompacted
   commits exists behind the head" (tracked as a `compactedTo` watermark
-  piggybacked on `head.json`, which the append path already writes) — so a
-  died `waitUntil` task is retried by the next boundary-crossing append.
+  piggybacked on `head.json`, which the append path already writes). The
+  check runs on every append, not only boundary-crossing ones — that is
+  what state-derived buys — so a died `waitUntil` task is retried by
+  whichever append comes next.
   Two writer populations update `head.json` (appenders bump the hint,
   compactors advance the watermark) with plain last-writer-wins PUTs, so a
   field can regress — an appender's stale read-modify-write can undo a
@@ -415,7 +442,10 @@ the deployment wires them into its append/read handlers (or the queue).
     freed-key mechanism append step 4 exists for), injectable pauses, 412s,
     404s — driving randomized interleavings of appenders, compactors, and
     readers. Property-checked invariants: no lost events, no duplicate
-    versions, readers always observe a contiguous prefix. Most of this
+    versions, no phantom reads (a reader never yields a commit whose
+    append was rejected — the freed-key-orphan schedule the sealed-bucket
+    read rule exists for), readers always observe a contiguous prefix.
+    Most of this
     design's correctness lives in race windows an integration suite can
     only sample; the simulator explores them deterministically and replays
     any failing schedule from its seed.
@@ -436,6 +466,9 @@ the deployment wires them into its append/read handlers (or the queue).
   commit batching and compaction matter more than payload size.
 - Append latency ≈ 1 GET (hint) + 1 LIST + 1 HEAD (hint corroboration) +
   1 PUT + 1 GET (step-4 chunk check, a fast 404) ≈ 60–150 ms on standard S3.
+  The step-5 `head.json` PUT is fire-and-forget (`waitUntil` on Workers) —
+  off the latency path, but it still counts against the shared subrequest
+  budget, as does any compaction the trigger fires.
   Cache the head in-process per stream to make hot-stream appends ≈ 1 PUT +
   1 GET: the cache is a hint that skips resolution, and skipping is sound
   *only because of* the step-4 chunk check — a stale-low cache plus
@@ -626,6 +659,12 @@ for untrusted callers.
 | Access granularity | Arbitrary (per-event filtering possible) | Key = capability for the whole stream, past and future until rotation — requires **authorization boundary = encryption boundary** |
 | Fit | Third parties, partial/filtered access | Per-user streams read by their own user (the dominant case) |
 
+Note on model A caching: Cloudflare's Cache API keys on URL and cannot
+vary on `Authorization`, so "cache key must include authorization scope"
+means synthesizing a cache-key URL that embeds the caller's scope (e.g. a
+scope hash as an extra path segment, used only for cache lookup). Never
+cache model-A plaintext under the bare request URL.
+
 Notes on model B:
 
 - A delivered key's TTL is an **authorization window, not disclosure
@@ -636,6 +675,15 @@ Notes on model B:
 - Keep ciphertext access-controlled, not public-but-encrypted: a leaked key
   or a future cipher break must not expose a stream's history to the world.
   The auth check is the worker request already being paid.
+- **Key rotation needs design before model B ships** (open question below).
+  "Until rotation" above is load-bearing for the authorization story, and
+  the two candidate semantics pull against different promises already
+  made: rotating for future events only (old readers keep the past; new
+  readers need both keys) preserves cache-forever ciphertext pages and
+  compaction's verbatim-copy rule; re-encrypting history breaks both.
+  Future-only is the likely answer, but it changes the key-delivery
+  endpoint's shape (multiple keys per stream), so decide and document it
+  before that endpoint exists.
 
 **Shred propagation rule (unified):** shred delay = the **maximum of all
 plaintext- and key-cache TTLs** — worker key caches, edge plaintext TTLs
@@ -686,7 +734,11 @@ The library ships no routes — auth and invariants are domain concerns.
 clock-driven job remains: the **shred sweeper** (cron; scans
 `$system/key-audit` for unmatched `ShredRequested` intents and resumes them).
 It legitimately needs a clock: a crashed shred has no guaranteed future write
-or read to revisit it, and erasure correctness has a deadline.
+or read to revisit it, and erasure correctness has a deadline. It
+checkpoints like any catch-up reader (a cursor object, CAS-updated),
+carrying still-open intents forward in its checkpoint state — each run
+scans only audit events since the last, never the whole stream. One
+sweeper per store: each prefix has its own `$system/key-audit` stream.
 
 **4. Client** —
 
@@ -892,3 +944,8 @@ that's subscriptions/projections, phase 4.)
 2. ~~Key-store choice~~ **Resolved**: a dedicated S3 bucket with wrapped keys
    is the default backend (see Erasure section); alternatives via the
    `KeyStore` interface.
+3. **Model B key rotation — needs design before phase 3's client SDK.**
+   Future-events-only vs re-encrypt-history (see Serverless deployment):
+   future-only preserves immutable ciphertext caching and verbatim-copy
+   compaction, but makes the key endpoint deliver multiple keys per stream
+   and complicates "key = capability for the whole stream." Unresolved.
