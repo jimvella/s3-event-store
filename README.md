@@ -231,7 +231,9 @@ erasure are specified in [KEYS_DESIGN.md](KEYS_DESIGN.md).
 
 ## Status
 
-Pre-release: this repository currently contains the design specification;
-implementation follows the roadmap in [DESIGN.md](DESIGN.md#roadmap)
-(scaffold → drivers + core append/read + deterministic simulation harness →
-compaction → encryption + browser client).
+Pre-release. Implemented so far (roadmap phase 1, in progress): the core
+append/read protocol (`src/`) and the deterministic simulation harness
+(`sim/` — seeded scheduler, in-memory S3 model, oracle, named-race
+regression scenarios; see [SIMULATOR_PLAN.md](SIMULATOR_PLAN.md)). Still
+ahead per [DESIGN.md](DESIGN.md#roadmap): drivers for real backends, head
+hints and caching, compaction, encryption, the browser client.
