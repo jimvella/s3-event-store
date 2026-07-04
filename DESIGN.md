@@ -104,8 +104,9 @@ Encryption & erasure contract).
    `c/{⌊v/N⌋·N}` for the version v just written. 404 — the overwhelmingly
    common case — confirms the append. An existing chunk that lacks our
    `commitId` means the PUT recreated a freed key: the events are unreadable
-   — readers ignore commits in chunked buckets, and the sealed-bucket read
-   rule (see Compaction failure modes) keeps the orphan invisible even to
+   — readers ignore commits in chunked buckets, and the pinned-GET and
+   sealed-bucket read
+   rules (see Compaction failure modes) keep the orphan invisible even to
    readers holding a pre-chunk `c/` listing — and the sweep will delete the
    object, so raise `ConcurrencyError` (the orphan is sweep garbage, never
    corruption). A chunk that *contains* our `commitId` is the lost-response
@@ -174,16 +175,23 @@ come from reading, never from key arithmetic.
 - `head.json` records `{ headVersion, lastCommitKey, compactedTo }` — the
   hint, its evidence, and the compaction watermark (see Scheduling).
 - Fast path: read the hint, then `ListObjectsV2` with
-  `StartAfter: e/{headVersion}` to pick up anything newer. If the LIST
+  `StartAfter: lastCommitKey` — the key, not a version the hint asserts,
+  so `headVersion` is never load-bearing for resolution. If the LIST
   returns keys, the newest commit anchors the head (GET it — version math
   comes from reading). If it returns nothing, the hint is the only
-  evidence: **HEAD `lastCommitKey` to corroborate it** before trusting it;
-  on 404, fall back to the cold path. Within the protocol the hint can only
+  evidence: **GET `lastCommitKey` and derive the head from its contents**
+  (base + event count − 1); on 404, fall back to the cold path. Within
+  the protocol the hint can only
   be stale-low (it is written after successful appends), but a stale-high
   hint from outside — manual deletion, a bucket restore, a foreign writer —
   would otherwise be accepted silently and mint the stale-high orphan
-  corruption above. One HEAD makes hint corruption fail safe instead of
-  fail corrupt. Usually 1 GET + 1 short LIST + 1 HEAD.
+  corruption above. Existence alone is not corroboration: a fabricated
+  `headVersion` beside a real `lastCommitKey` would pass a bare HEAD and
+  still mint the orphan. Deriving the head from the commit body makes
+  every hint corruption fail safe instead of
+  fail corrupt. Usually 1 GET (hint) + 1 short LIST + 1 GET (tail anchor
+  or corroboration). `headVersion` stays in `head.json` as a
+  human-readable diagnostic only.
 - Cold path (no or invalidated hint): LIST `c/` first and GET the last
   chunk — its recorded last commit key seeds `StartAfter` for the `e/`
   LIST, so the walk covers only the uncompacted tail rather than every
@@ -247,7 +255,7 @@ await repo.save("order-123", version, newEvents);
   makes this loop idempotent: a lost-response retry is recognized as our own
   commit, never re-appended at a new version.
 
-## Subscriptions / projections (v2)
+## Subscriptions / projections (phase 4)
 
 Two composable pieces, shipped as a separate entry point (`s3-event-store/subscribe`):
 
@@ -262,7 +270,7 @@ Two composable pieces, shipped as a separate entry point (`s3-event-store/subscr
 This gives correct projections without pretending S3 has a global log: the
 notification is a doorbell, the stream read is the source of truth.
 
-## Compaction protocol (phase 3)
+## Compaction protocol (phase 2)
 
 Per-commit objects are right for the write path (durability + concurrency) but
 make deep replays GET-heavy: 1M commits = 1M GETs. Compaction rewrites cold,
@@ -313,8 +321,9 @@ buffers a whole bucket while assembling its chunk, and a bucket can hold up
 to N commits (all single-event), so worst-case chunk size is N × the
 **per-commit byte cap**. The two caps are one constraint — **byteCap × N ≤
 compactor memory budget** — and must be picked together: against Workers'
-128 MB limit with assembly headroom, N = 500 implies a cap around
-128–256 KB per commit, not megabytes. Both live in store config alongside
+128 MB limit, N = 500 implies a cap of ~128 KB per commit, not megabytes
+(256 KB × 500 would already equal the entire limit, leaving no assembly
+headroom). Both live in store config alongside
 N; the cap also keeps REST page assembly cheap.
 
 **Compactor steps (per stream):**
@@ -360,25 +369,41 @@ N; the cap also keeps REST page assembly cheap.
 - *Contiguous phantom (freed-key orphan)* → contiguity has one blind spot.
   A stalled writer's recreation at a freed key (rejected by append step 4,
   but the object persists until the sweep) sits at exactly the base where
-  the compacted bucket's first commit used to be. A reader whose `c/` LIST
-  predates that bucket's chunk and whose `e/` LIST lands after the source
-  deletes finds the orphan *filling* the discontinuity — and would yield
-  events whose writer was told they failed, in place of the real ones in
-  the chunk. Closing rule: **never yield tail commits from a sealed bucket
-  without confirming it has no chunk.** Bucket *k* is visibly sealed to
-  the reader when its own listing contains a commit with base ≥ (k+1)·N;
-  chunks are dense, so only the first sealed bucket past the reader's last
-  known chunk needs the check — one HEAD on `c/{k·N}`, paid only when the
-  tail spans a bucket boundary. If the chunk exists it is authoritative:
-  discard that bucket's `e/` commits and read the chunk. An unsealed
-  bucket can never be chunked, so the hot tail — the common case — pays
-  nothing. All three races resolve as retry latency, never a silent gap
-  or substitution.
+  a compacted commit used to be, and can fill a discontinuity — a reader
+  would yield events whose writer was told they failed, in place of the
+  real ones in the chunk. Two closing rules, jointly airtight at zero
+  added request cost:
+  1. **Pin GETs to the listing.** Every tail-commit GET carries
+     `If-Match` with the ETag the `e/` LIST reported for that key (the
+     driver contract includes conditional GET). A 412 means the object
+     was replaced after the LIST — same recovery as the GET-time 404:
+     re-check `c/`. This closes every post-LIST substitution, including
+     the schedule where a bucket that was genuinely unsealed at LIST time
+     seals, is chunked, and has a key recreated all before the reader's
+     GET lands — a window no sealed-bucket check can see, because the
+     reader's listing correctly showed the bucket as hot tail.
+  2. **Sealed-bucket check**, for orphans already present at LIST time:
+     **never yield tail commits from a sealed bucket without confirming
+     it has no chunk.** An orphan in the listing implies its bucket's
+     chunk predates the listing, which implies the bucket is *visibly*
+     sealed in that same listing (sealing bucket *k* required a live
+     commit with base ≥ (k+1)·N, and the tail never empties). Chunks are
+     dense, so only the first sealed bucket past the reader's last known
+     chunk needs the check — one HEAD on `c/{k·N}`, issued **after** the
+     `e/` LIST it guards (before it, the chunk may not exist yet and the
+     check passes vacuously), paid only when the tail spans a bucket
+     boundary. If the chunk exists it is authoritative: discard that
+     bucket's `e/` commits and read the chunk.
+  A bucket unsealed at LIST time can never hold a LIST-time orphan, so
+  the hot tail — the common case — pays nothing beyond the ETags the
+  LIST already returned. All three races resolve as retry latency, never
+  a silent gap or substitution.
 
 **Reader path with chunks:** LIST `c/` (few keys) → GET relevant chunks →
 LIST `e/` with `StartAfter` the last chunk's last commit key (recorded in the
-chunk body) → GET tail commits, ignoring any commit whose base falls in an
-existing chunk's bucket, verifying version contiguity and the sealed-bucket
+chunk body) → GET tail commits pinned with `If-Match` to the LIST's ETags,
+ignoring any commit whose base falls in an existing chunk's bucket,
+verifying version contiguity and the sealed-bucket
 rule throughout (see failure modes above). A 1M-event replay becomes ~2k
 chunk GETs plus a short tail.
 
@@ -448,14 +473,18 @@ the deployment wires them into its append/read handlers (or the queue).
 - **Tests**:
   - Unit: key codec, envelope schema, version math, error mapping (mock SDK).
   - **Simulation (the highest-leverage suite):** a deterministic in-memory
-    S3 model — strong consistency, conditional PUTs, versioned-bucket
+    S3 model — strong consistency, conditional PUTs, conditional GETs
+    (`If-Match`), versioned-bucket
     delete markers (DELETE then `If-None-Match: *` re-create succeeds: the
     freed-key mechanism append step 4 exists for), injectable pauses, 412s,
     404s — driving randomized interleavings of appenders, compactors, and
     readers. Property-checked invariants: no lost events, no duplicate
     versions, no phantom reads (a reader never yields a commit whose
-    append was rejected — the freed-key-orphan schedule the sealed-bucket
-    read rule exists for), readers always observe a contiguous prefix.
+    append was rejected — the freed-key-orphan schedules the pinned-GET
+    and sealed-bucket
+    read rules exist for, including the post-LIST substitution where a
+    listed key is compacted, freed, and recreated before its GET), readers
+    always observe a contiguous prefix.
     Most of this
     design's correctness lives in race windows an integration suite can
     only sample; the simulator explores them deterministically and replays
@@ -475,7 +504,7 @@ the deployment wires them into its append/read handlers (or the queue).
 - PUT/LIST ≈ $0.005 per 1k, GET ≈ $0.0004 per 1k. An aggregate with 1M commits
   costs ~$5 to write, storage is negligible. Reads dominated by request count →
   commit batching and compaction matter more than payload size.
-- Append latency ≈ 1 GET (hint) + 1 LIST + 1 HEAD (hint corroboration) +
+- Append latency ≈ 1 GET (hint) + 1 LIST + 1 GET (hint corroboration) +
   1 PUT + 1 GET (step-4 chunk check, a fast 404) ≈ 60–150 ms on standard S3.
   The step-5 `head.json` PUT is fire-and-forget (`waitUntil` on Workers) —
   off the latency path, but it still counts against the shared subrequest
@@ -483,8 +512,9 @@ the deployment wires them into its append/read handlers (or the queue).
   Cache the head in-process per stream to make hot-stream appends ≈ 1 PUT +
   1 GET: the cache is a hint that skips resolution, and skipping is sound
   *only because of* the step-4 chunk check — a stale-low cache plus
-  compaction is exactly the freed-key case it catches (a 412 already forces
-  re-resolution, and stale-high cannot arise: the process only caches heads
+  compaction is exactly the freed-key case it catches (a 412 forces
+  re-resolution, a step-4 `ConcurrencyError` must invalidate the cache the
+  same way, and stale-high cannot arise: the process only caches heads
   it observed).
 - Long streams: reading 10k commits = 10k GETs. Mitigations, in order:
   background **compaction** into chunk objects (see Compaction protocol —
@@ -594,9 +624,13 @@ declare a bounded TTL; those TTLs feed the unified shred-delay budget in
 (`env.BUCKET.put(key, val, { onlyIf })`) — no request signing, no SDK weight.
 The core therefore defines a minimal driver interface
 (`get` / `putIfAbsent` / `putIfMatch` / `list` / `delete` / `deleteMany`)
-with three implementations. Batch delete is first-class because compaction
+with three implementations. `get` takes an optional `ifMatch` etag — the
+read path's pinned GETs depend on it (S3 `GetObject` `IfMatch`, R2 binding
+`onlyIf.etagMatches`; conformance-test alongside the conditional PUTs).
+Batch delete is first-class because compaction
 needs it; `list` takes a prefix plus `startAfter` and returns
-lexicographically ordered pages with an explicit continuation token — the
+lexicographically ordered pages — each key with its etag, which the pinned
+GETs consume — with an explicit continuation token — the
 contract the head-discovery and read paths assume. Implementations:
 
 - `r2-binding` — native bindings; **conformance-test its `onlyIf`
