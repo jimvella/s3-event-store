@@ -72,6 +72,12 @@ in the id. Prefixes follow the same no-PII rule as stream IDs (see Erasure).
 **Append protocol**
 
 1. Resolve the stream head (current version) — see Head discovery below.
+   Head resolution is **mandatory and authoritative for rejection**: if
+   `expectedVersion` doesn't match the resolved head, raise
+   `ConcurrencyError` before any PUT. The conditional PUT is not the
+   version check — `If-None-Match: *` proves only that the key is absent,
+   and once compaction can delete keys, absence no longer implies "next
+   version" (see below).
 2. `PutObject` the commit object at key `e/{head+1}` with `If-None-Match: *`.
    The body carries a writer-generated `commitId`.
 3. On HTTP 412: GET the key just targeted and compare `commitId`. If it is
@@ -87,8 +93,24 @@ in the id. Prefixes follow the same no-PII rule as stream IDs (see Erasure).
 
 This is lock-free and correct: two writers targeting the same version can never
 both succeed, and a commit object containing N events is atomic by construction
-(one PUT). The conditional PUT *is* the concurrency check — `expectedVersion`
-from the caller just selects which key we attempt.
+(one PUT). Division of labor: head resolution rejects stale intent; the
+conditional PUT guards only the resolve→PUT race window. Within that window
+it is sound: freeing the target key would require a full bucket of later
+commits *plus* a complete compaction cycle to land inside the window, and
+compaction never touches keys at or above the head.
+
+Why the head check cannot be skipped — three silent corruptions otherwise:
+
+- `"noStream"` on a compacted stream: bucket 0's commits are deleted, so a
+  blind create-only PUT at `e/0` **succeeds** — but readers ignore commits
+  whose bucket has a chunk, so the append reports success while its events
+  are unreadable forever.
+- Stale-low `expectedVersion` below the compaction watermark: same
+  mechanism — a spurious "success" instead of `ConcurrencyError`.
+- Stale-high `expectedVersion`: the PUT lands at an unoccupied future key,
+  creating an orphan commit past a version gap; head discovery (LIST max)
+  then treats the orphan as the head and the stream is permanently
+  corrupted.
 
 **Commit object body** (JSON):
 
@@ -166,7 +188,9 @@ await repo.save("order-123", version, newEvents);
 
 `expectedVersion` semantics:
 - number `n` → commit must land at version `n+1`
-- `"noStream"` → stream must not exist (PUT at version 0)
+- `"noStream"` → stream must not exist, verified by head resolution finding
+  no commits *and* no chunks — never by the PUT alone (on a compacted
+  stream `e/0` is a freed key and a blind create-only PUT would "succeed")
 - `"any"` → resolve head and retry the conditional PUT on 412 up to a bounded
   retry count (still atomic, just relaxed intent). The `commitId` self-check
   makes this loop idempotent: a lost-response retry is recognized as our own
@@ -209,11 +233,23 @@ be needed by two chunks and deleted after only the first exists — data loss.
 Any compactor still computes the same key for the same bucket without
 coordination.
 
+Buckets are fixed windows over base-version space and never resize — that
+determinism is what lets uncoordinated compactors compute identical chunk
+keys. One consequence: a commit with more than N events can straddle far
+enough that the next bucket contains no bases at all (base 499 + 600 events
+→ next base 1099; bucket [500, 999] is empty). Empty buckets get **no chunk
+object** — the compactor skips them and the `compactedTo` watermark advances
+past them. Chunk keys are therefore not dense, which readers already
+tolerate: chunks are discovered by LISTing `c/`, never by key arithmetic,
+and a REST page covering an empty bucket's version range is served from the
+preceding straddling chunk by the read handler.
+
 **Chunk size N = 500, fixed per store.** The Workers deployment runs
 compaction inside `waitUntil`, which shares the invoking request's
 ~1,000-subrequest budget (R2 binding calls count); one chunk costs ~N GETs +
 1 PUT + 1 batched DELETE, so N = 500 leaves headroom for the request's own
-work. N is a store-level constant: chunk keys and REST page URLs derive from
+work — which is always an append's few calls, since compaction is
+write-triggered only (see Scheduling). N is a store-level constant: chunk keys and REST page URLs derive from
 it, so changing it under existing data means a full recompaction — pick once,
 record it in store config.
 
@@ -238,14 +274,24 @@ record it in store config.
 - *Racing compactors* → deterministic boundaries mean identical chunk keys;
   `If-None-Match: *` picks one winner, the loser 412s and proceeds to deletes.
   Same lock-free primitive as the append path.
-- *Reader racing the deletes* → a 404 on a commit the reader just LISTed means
-  "compacted": re-check `c/` for a chunk covering that version. Chunk PUT
-  strictly precedes deletes, so the data is always in one of the two places.
+- *Reader racing the deletes* → two shapes, both recoverable because chunk
+  PUT strictly precedes deletes (the data is always in one of the two
+  places). **GET-time**: a 404 on a commit the reader just LISTed means
+  "compacted" — re-check `c/` for a chunk covering that version.
+  **LIST-time**: if the compactor runs between the reader's `c/` LIST and
+  its `e/` LIST (or between `e/` pages), a whole bucket's commits are
+  simply absent from the listing and no GET ever 404s. Readers therefore
+  **verify contiguity as they yield**: each commit's base must equal the
+  previous base plus the previous commit's event count (event versions are
+  dense even though keys are not). A discontinuity means "compacted since
+  our `c/` LIST" — re-LIST `c/` and fill the gap from the new chunk. Both
+  races resolve as retry latency, never a silent gap.
 
 **Reader path with chunks:** LIST `c/` (few keys) → GET relevant chunks →
 LIST `e/` with `StartAfter` the last chunk's last commit key (recorded in the
 chunk body) → GET tail commits, ignoring any commit whose base falls in an
-existing chunk's bucket. A 1M-event replay becomes ~2k chunk GETs plus a
+existing chunk's bucket, verifying version contiguity throughout (see
+failure modes above). A 1M-event replay becomes ~2k chunk GETs plus a
 short tail.
 
 **Cost:** per chunk ≈ N GETs + 1 PUT + 1 batched DELETE. DELETEs are free
@@ -259,28 +305,36 @@ cannot conflict with appends — the write path doesn't know it exists. It
 copies payload bytes verbatim, so it works on encrypted payloads without any
 key-store access (keeps compactor IAM minimal).
 
-**Scheduling — write/read-driven, no cron.** Sloppy triggering is safe by
+**Scheduling — write-driven, no cron.** Sloppy triggering is safe by
 construction (deterministic keys + `If-None-Match` + sweep make duplicate or
-racing invocations harmless), which permits driving compaction from the paths
-that already run:
+racing invocations harmless), which permits driving compaction from the write
+path that already runs:
 
-- **Write-triggered (primary):** after a successful append, the writer checks
-  the trigger condition with pure arithmetic (it knows the version it just
-  wrote) and fires `ctx.waitUntil(compactStream(id))` — response returns
+- **Write-triggered (the mechanism):** after a successful append, the writer
+  checks the trigger condition with pure arithmetic (it knows the version it
+  just wrote) and fires `ctx.waitUntil(compactStream(id))` — response returns
   immediately, ~N I/O-bound GETs run in background time. The condition is
-  **state-derived, not event-derived**: "a complete, uncompacted chunk exists
-  behind the head" (tracked as a `compactedTo` watermark piggybacked on
-  `head.json`, which the append path already writes) — so a died `waitUntil`
-  task is retried by the next boundary-crossing append. Self-healing, no
-  lost-trigger failure mode.
-- **Read-triggered (backstop):** a reader that traverses complete-but-
-  uncompacted chunks fires the same `waitUntil` on its way out. This covers
-  quiet-but-read streams; a stream that is neither written nor read doesn't
-  benefit from compaction, so no clock-based sweep is needed — coverage is
-  complete without cron.
+  **state-derived, not event-derived**: "a sealed bucket with uncompacted
+  commits exists behind the head" (tracked as a `compactedTo` watermark
+  piggybacked on `head.json`, which the append path already writes) — so a
+  died `waitUntil` task is retried by the next boundary-crossing append.
+  Appends are also the **only** invocations that fire compaction: an
+  append's own subrequest cost is small, so ~N compaction GETs fit
+  comfortably in the shared budget. (A read-triggered backstop was
+  considered and dropped: it fires precisely when the request has already
+  spent ~N GETs traversing the uncompacted path, stacking compaction's ~N
+  more against the ~1,000-subrequest ceiling.)
+- **Accepted gap:** a stream that crosses a chunk boundary, loses its
+  `waitUntil` task, and is then never written again keeps its final sealed
+  buckets uncompacted indefinitely. Bounded cost, not a correctness issue:
+  readers pay ~N origin GETs per such bucket, and because complete REST
+  pages are immutable and cached regardless of compaction state, the
+  penalty is paid once per edge location, not per replay. Any future
+  append heals it.
 - **Queue variant (high-throughput opt-in):** R2 event notifications → Queue
   → consumer, for retries/DLQ/15-min windows off the request path entirely;
-  reuses the notification pipe projections already need.
+  reuses the notification pipe projections already need. Also the upgrade
+  path if the accepted gap above ever matters in practice.
 
 The library ships `compactStream(streamId)` + the cheap trigger check;
 the deployment wires them into its append/read handlers (or the queue).
@@ -549,7 +603,7 @@ library:
 The library ships no routes — auth and invariants are domain concerns.
 (A Hono-style middleware helper is a possible later convenience export.)
 
-**3. Background jobs** — with compaction write/read-driven, exactly one
+**3. Background jobs** — with compaction write-driven, exactly one
 clock-driven job remains: the **shred sweeper** (cron; scans
 `$system/key-audit` for unmatched `ShredRequested` intents and resumes them).
 It legitimately needs a clock: a crashed shred has no guaranteed future write
@@ -693,11 +747,11 @@ cached response is ever invalidated by compaction. Rules that make this hold:
 
 Net effect: a long replay streams almost entirely from the edge cache
 regardless of whether compaction has run; compaction only changes what a
-cache miss costs (~1 chunk GET vs ~N commit GETs). The read-triggered
-compaction backstop lives in this same handler — the reader that pays the
-slow uncompacted path fires `waitUntil(compactStream(id))` on the way out,
-so the API is what heals uncompacted streams. Cache, API, and storage
-converge on the same unit: the chunk.
+cache miss costs (~1 chunk GET vs ~N commit GETs). This is also what makes
+write-only compaction triggering acceptable (see Scheduling): even a stream
+whose final buckets never get compacted pays the uncompacted price once per
+edge location, after which its immutable pages serve from cache. Cache, API,
+and storage converge on the same unit: the chunk.
 
 ### Reverse reads
 
