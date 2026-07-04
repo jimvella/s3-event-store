@@ -30,6 +30,7 @@ export {
   type TombstoneState,
 } from "./crypto/keystore.js";
 export { aesMasterKey, type MasterKey } from "./crypto/master-key.js";
+export { rewrapKeys, type RewrapReport } from "./crypto/rewrap.js";
 export {
   AUDIT_STREAM,
   cancelShred,

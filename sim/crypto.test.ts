@@ -13,6 +13,7 @@ import {
   tombstoneKey,
   type Tombstone,
 } from "../src/crypto/keystore";
+import { rewrapKeys } from "../src/crypto/rewrap";
 import { encryptingSerializer } from "../src/crypto/serializer";
 import {
   AUDIT_STREAM,
@@ -354,6 +355,72 @@ describe("shred lifecycle", () => {
     clockRef.now += 15 * DAY;
     const report = await sweepShreds(shredCtx);
     expect(report.hardDeleted).toEqual([SUBJECT]);
+    expect(keySim.dump().has(generationKey(SUBJECT, 0))).toBe(false);
+  });
+});
+
+describe("master-key re-wrap", () => {
+  const NEW_SECRET = new Uint8Array(32).fill(9);
+
+  it("rewraps every generation; ciphertext and caches never notice; idempotent under resume", async () => {
+    const { store, keys, keyDriver, clockRef } = setup();
+    await store.append("user-1", [{ type: "T", data: "d0", id: "e0" }], { expectedVersion: "noStream" });
+    await keys.rotate(SUBJECT);
+    await store.append("user-2", [{ type: "T", data: "d1", id: "e1" }], { expectedVersion: "noStream" });
+
+    const from = aesMasterKey(SECRET);
+    const to = aesMasterKey(NEW_SECRET);
+    const report = await rewrapKeys({ driver: keyDriver, from, to });
+    expect(report).toEqual({ rewrapped: 3, alreadyCurrent: 0, skipped: 0, failed: [] });
+
+    // A key store under the NEW master decrypts everything — including
+    // ciphertext written before the rewrap (ciphertext never noticed).
+    const rewrappedKeys = createS3KeyStore({
+      driver: keyDriver,
+      masterKey: to,
+      clock: () => clockRef.now,
+      keyCacheTtlMs: 0,
+      tombstoneTtlMs: 0,
+    });
+    expect(await rewrappedKeys.keyById(SUBJECT, "000000")).not.toBeNull();
+    expect(await rewrappedKeys.keyById(SUBJECT, "000001")).not.toBeNull();
+    expect((await rewrappedKeys.keyring("subject:user-2")).length).toBe(1);
+
+    // Resume is idempotent: nothing left to do, nothing double-wrapped.
+    const again = await rewrapKeys({ driver: keyDriver, from, to });
+    expect(again).toEqual({ rewrapped: 0, alreadyCurrent: 3, skipped: 0, failed: [] });
+  });
+
+  it("a rewrap racing a shred skips on the CAS and never resurrects the deleted key", async () => {
+    const { store, keySim, keyDriver } = setup();
+    await store.append("user-1", [{ type: "T", data: "d0", id: "e0" }], { expectedVersion: "noStream" });
+
+    // Hold the rewrap between its GET and its CAS write-back; the shred's
+    // hard delete lands in the window.
+    let reach!: () => void;
+    let release!: () => void;
+    const reached = new Promise<void>((r) => (reach = r));
+    const released = new Promise<void>((r) => (release = r));
+    const gated = {
+      ...keyDriver,
+      putIfMatch: async (key: string, body: string, etag: string) => {
+        reach();
+        await released;
+        return keyDriver.putIfMatch(key, body, etag);
+      },
+    };
+    const running = rewrapKeys({
+      driver: gated,
+      from: aesMasterKey(SECRET),
+      to: aesMasterKey(NEW_SECRET),
+    });
+    await reached;
+    keySim.delete(generationKey(SUBJECT, 0)); // the hard delete
+    release();
+
+    const report = await running;
+    expect(report).toEqual({ rewrapped: 0, alreadyCurrent: 0, skipped: 1, failed: [] });
+    // The resurrection guard: the shredded key stays deleted.
     expect(keySim.dump().has(generationKey(SUBJECT, 0))).toBe(false);
   });
 });
