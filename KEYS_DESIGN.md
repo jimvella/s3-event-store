@@ -412,7 +412,7 @@ refinement. Trade-offs:
 
 **Decision**: the core library defines the serializer interface from day one;
 the whole-payload encrypting serializer + key store ship in roadmap phase 3
-(see DESIGN.md's Roadmap). Field-level is phase 5 with fail-closed defaults,
+(see DESIGN.md's Roadmap). Field-level is phase 4 with fail-closed defaults,
 only if real demand shows up — it's the kind of API that's expensive to get
 wrong.
 

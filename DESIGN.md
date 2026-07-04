@@ -24,7 +24,7 @@ secondary database. Correctness rests on two S3 guarantees:
 **Non-goals (v1)**
 
 - Totally-ordered global (all-streams) log. Per-stream order is guaranteed;
-  cross-stream feeds are eventually ordered (see Subscriptions).
+  cross-stream feeds are eventually ordered (see Future work).
 - Transactions spanning multiple streams.
 - Sub-10ms latency. Standard S3 appends cost ~20–60 ms; an S3 Express One Zone
   backend is a later optimization.
@@ -268,14 +268,6 @@ const result = await store.append("order-123", [
 
 // Read
 for await (const e of store.read("order-123", { fromVersion: 0 })) { ... }
-
-// Optional higher-level aggregate helper (separate entry point)
-const repo = createRepository(store, {
-  evolve: (state, event) => ...,
-  init: () => ...,
-});
-const { state, version } = await repo.load("order-123");
-await repo.save("order-123", version, newEvents);
 ```
 
 **Error taxonomy**: `ConcurrencyError` (412 race), `StreamNotFoundError`,
@@ -292,21 +284,6 @@ await repo.save("order-123", version, newEvents);
   retry count (still atomic, just relaxed intent). The `commitId` self-check
   makes this loop idempotent: a lost-response retry is recognized as our own
   commit, never re-appended at a new version.
-
-## Subscriptions / projections (phase 4)
-
-Two composable pieces, shipped as a separate entry point (`s3-event-store/subscribe`):
-
-1. **Catch-up reader**: given a checkpoint (`streamId → version` map, or a
-   per-projection checkpoint object in S3 written with `If-Match` CAS), scan
-   and replay. Works anywhere, purely poll-based.
-2. **Live notifications**: S3 Event Notifications → EventBridge/SQS. The
-   notification carries the object key (stream + base version); the consumer
-   GETs the commit. Delivery is at-least-once and unordered **across** streams,
-   ordered enough **within** a stream to trigger "read from checkpoint to head."
-
-This gives correct projections without pretending S3 has a global log: the
-notification is a doorbell, the stream read is the source of truth.
 
 ## Compaction protocol (phase 2)
 
@@ -524,8 +501,9 @@ path that already runs:
   append heals it.
 - **Queue variant (high-throughput opt-in):** R2 event notifications → Queue
   → consumer, for retries/DLQ/15-min windows off the request path entirely;
-  reuses the notification pipe projections already need. Also the upgrade
-  path if the accepted gap above ever matters in practice.
+  the same notification pipe subscriptions would use if ever adopted (see
+  Future work). Also the upgrade path if the accepted gap above ever
+  matters in practice.
 
 The library ships `compactStream(streamId)` + the cheap trigger check;
 the deployment wires them into its append/read handlers (or the queue).
@@ -534,9 +512,9 @@ the deployment wires them into its append/read handlers (or the queue).
 
 - **Name**: `s3-event-store` (or scoped `@<you>/…`) — check npm availability.
 - **Build**: tsup → dual ESM/CJS + `.d.ts`; Node ≥ 20; `"sideEffects": false`.
-- **Structure**: single package, subpath exports (`.`, `./subscribe`,
-  `./repository`, `./client`, `./drivers/r2-binding`, `./drivers/aws-sdk`,
-  `./drivers/aws4fetch`) rather than a monorepo — keep it one dependency;
+- **Structure**: single package, subpath exports (`.`, `./client`,
+  `./drivers/r2-binding`, `./drivers/aws-sdk`, `./drivers/aws4fetch`)
+  rather than a monorepo — keep it one dependency;
   drivers and the browser client stay tree-shakeable for Workers bundles.
 - **Tests**:
   - Unit: key codec, envelope schema, version math, error mapping (mock SDK).
@@ -736,11 +714,11 @@ contract the head-discovery and read paths assume. Implementations:
 ## Component inventory & REST surface
 
 Scoped to the initial application: **no projections/subscriptions** — all
-client reads are stream-shaped. Cross-stream queries add them later (roadmap
-phase 4); nothing below needs rework when they arrive.
+client reads are stream-shaped. Cross-stream queries would add them
+(unplanned — see Future work); nothing below needs rework if they arrive.
 
 **1. Core library (the npm package)** — the only shipped software. Storage
-drivers, event store (append/read), repository helper, serializers
+drivers, event store (append/read), serializers
 (incl. the encrypting one), `KeyStore` interface + S3-bucket implementation,
 `compactStream()` + trigger check, shred workflow helpers (crypto and
 erasure behavior: [KEYS_DESIGN.md](KEYS_DESIGN.md)). A dependency, never a service — it
@@ -952,7 +930,7 @@ imply a precision the store cannot honestly provide. Clients that need time
 filtering scan by version and filter locally, treating timestamps as
 approximate; document this explicitly. ("All events across the system in
 [T₁, T₂]" is the global-feed problem this design deliberately excludes —
-that's subscriptions/projections, phase 4.)
+that's subscriptions/projections, unplanned future work.)
 
 ## Alternatives & prior art
 
@@ -1059,10 +1037,29 @@ replay, erasure built in. No two of those coexist in any product found.
 |-------|-------|
 | 0 | Scaffold: tsup, vitest, CI, key codec + envelope with 100% unit coverage |
 | 1 | Storage-driver interface + `r2-binding`/`aws-sdk`/`aws4fetch` drivers (incl. `onlyIf` conformance tests); `append`/`read` + optimistic concurrency + error taxonomy + **deterministic simulation harness** + integration tests |
-| 2 | Head hints, in-process head cache, repository helper, **compaction** (the replay mitigation, now snapshot-free) |
+| 2 | Head hints, in-process head cache, **compaction** (the replay mitigation, now snapshot-free) |
 | 3 | S3 Express backend, compression + whole-payload crypto-shredding serializer with pluggable key store (per [KEYS_DESIGN.md](KEYS_DESIGN.md)), browser client SDK (`./client`) |
-| 4 | Subscriptions: checkpointed catch-up + EventBridge/SQS adapter |
-| 5 | Field-level encryption (fail-closed defaults), if demand warrants |
+| 4 | Field-level encryption (fail-closed defaults), if demand warrants |
+
+## Future work (unplanned)
+
+Explicitly outside the roadmap — sketched only to record the pieces already
+worked out and to show the design doesn't foreclose them:
+
+- **Repository helper** (`./repository`): optional aggregate load/save over
+  `append`/`read` — an `init`/`evolve` fold, `load` returning
+  `{ state, version }`, `save` appending with the loaded version. Pure
+  convenience; nothing in the core assumes it.
+- **Subscriptions / projections** (`./subscribe`): two composable pieces —
+  a checkpointed catch-up reader (per-projection checkpoint object in S3
+  written with `If-Match` CAS; works anywhere, purely poll-based), and live
+  notifications (S3 Event Notifications → EventBridge/SQS, or R2 → Queues;
+  the notification carries the object key, delivery is at-least-once and
+  unordered across streams, ordered enough within one to trigger "read from
+  checkpoint to head"). The notification is a doorbell, the stream read the
+  source of truth — correct projections without pretending S3 has a global
+  log. Nothing in the current surface needs rework if this arrives;
+  cross-stream query demand is the trigger to build it.
 
 ## Open questions
 
