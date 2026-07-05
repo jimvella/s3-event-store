@@ -199,6 +199,52 @@ while (url) {
 Complete pages are served with `Cache-Control: immutable` — a replay
 streams from the edge cache, and only the final partial page ever re-polls.
 
+### Serving the feed — the worker side
+
+The library ships the page/head/append helpers; the worker owns routes,
+auth, and headers. `pageSize` defaults to the store's `chunkSize`, so page
+URLs are chunk-aligned (identical across all clients — the edge-cache hit
+rate depends on it):
+
+```ts
+import {
+  readPage, toWireFeed, canonicalFrom,
+  readHead, toWireHead,
+  idempotentAppend,
+} from "@jimvella/s3-event-store";
+
+const hrefFor = (from: number) => `/app-x/orders/streams/${id}/events?from=${from}`;
+
+// GET …/events?from=v — one page; redirect mid-page cursors to canonical
+const page = await readPage(store, id, { from });
+if (from !== page.from) return Response.redirect(hrefFor(page.from), 308);
+return Response.json(toWireFeed(page, hrefFor), {
+  headers: {
+    "Cache-Control": page.complete
+      ? "public, max-age=31536000, immutable" // frozen forever, incl. its links
+      : "no-store",                           // still-growing head page
+  },
+});
+
+// GET …/head — the poll target; ETag makes an unchanged poll a free 304
+const head = await readHead(store, id);
+if (request.headers.get("If-None-Match") === head.etag) {
+  return new Response(null, { status: 304, headers: { ETag: head.etag } });
+}
+return Response.json(toWireHead(head, hrefFor), {
+  headers: { ETag: head.etag, "Cache-Control": "no-cache" },
+});
+
+// POST …/append — raw ingress (only if you expose append instead of domain
+// commands). Clients send stable event ids and an explicit expectedVersion;
+// a retried request that already committed reports success, no duplicate.
+const r = await idempotentAppend(store, id, events, { expectedVersion });
+return Response.json(r, { status: r.outcome === "appended" ? 201 : 200 });
+```
+
+A poll loop is then: `GET head` with `If-None-Match` → on `304` sleep and
+retry; on `200` follow the `head` link and read forward.
+
 ### Encrypted streams in the browser
 
 For client-decrypted (model B) streams, the browser SDK handles keyring
@@ -247,7 +293,12 @@ startup config verification), and the crypto-shredding workflow
 period, sweeper-executed hard delete). The deterministic simulation harness
 (`sim/`; see [SIMULATOR_PLAN.md](SIMULATOR_PLAN.md)) checks the full
 invariant set, including no-forged-heads and every-committed-event-readable
-after every mutation. Also done: the browser client SDK (`./client` —
+after every mutation. Also done: the worker-facing
+HTTP surface (`src/http.ts`: `readPage`/`toWireFeed` chunk-aligned pages
+with the `complete ⇔ next` immutability invariant, `readHead`/`toWireHead`
+poll target with version-derived ETag for `If-None-Match` → 304, and
+`idempotentAppend` — retry-safe raw ingress deduping by event id against
+the exact target window); the browser client SDK (`./client` —
 keyring fetch/TTLs, local AES-GCM decryption, link-following with
 permanent complete-page caching, upcasters, fold) and the build plumbing
 (`npm run build`: tsup dual ESM/CJS + `.d.ts` for all five subpath

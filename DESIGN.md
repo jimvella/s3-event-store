@@ -739,7 +739,12 @@ client reads are stream-shaped. Cross-stream queries would add them
 drivers, event store (append/read), serializers
 (incl. the encrypting one), `KeyStore` interface + S3-bucket implementation,
 `compactStream()` + trigger check, shred workflow helpers (crypto and
-erasure behavior: [KEYS_DESIGN.md](KEYS_DESIGN.md)). A dependency, never a service — it
+erasure behavior: [KEYS_DESIGN.md](KEYS_DESIGN.md)), and the worker-facing
+HTTP surface helpers (`readPage`/`toWireFeed` — chunk-aligned pages with the
+`complete` immutability flag; `readHead`/`toWireHead` — the poll target with
+its version-derived ETag; `idempotentAppend` — retry-safe raw ingress). The
+helpers are transport-agnostic (cursors in, wire shapes out via `hrefFor`);
+routes, auth, and headers stay in the worker. A dependency, never a service — it
 owns no process.
 
 **2. Application worker (deployment code)** — thin HTTP handlers over the
@@ -857,15 +862,36 @@ load-bearing ideas survive here without the XML.
 {
   "streamId": "order-123",
   "from": 0,
-  "to": 499,
-  "complete": true,          // full page ⇒ served with Cache-Control: immutable
+  "to": 500,                 // exclusive: the page covers [from, to)
+  "complete": true,          // head moved past this page ⇒ frozen (events AND
+                             // next link) ⇒ served with Cache-Control: immutable
   "events": [
     { "id": "…", "type": "OrderShipped", "version": 5,
       "data": { … },         // model A — or "ciphertext": "base64…" in model B
       "meta": { "ts": "…", "correlationId": "…" } }
   ],
-  "next": "/streams/order-123/events?from=500",   // absent ⇒ at head
+  "next": "/streams/order-123/events?from=500",   // null ⇒ at head
   "prev": null                                    // page k−1; null on page 0
+}
+```
+
+`complete ⇔ next ≠ null` by construction: a page is declared immutable
+only once the head has advanced *past* it (an event exists at `to` or
+beyond) — the same fact that determines its `next` link. Declaring a
+brim-full page complete while its `next` is still `null` would freeze a
+body that can never surface its successor. A partial (or brim-full, or
+past-the-head) page is `complete: false`, `next: null`, and served
+short-TTL / no-store.
+
+The head resource (`GET …/head`) is the second wire shape:
+
+```jsonc
+{
+  "streamId": "order-123",
+  "version": 371,            // current head; null ⇒ stream does not exist yet
+  "head": "/streams/order-123/events?from=0",     // link to the page containing
+                                                  // the head — always incomplete
+  "etag": "\"v371\""         // also emitted as the ETag header; If-None-Match ⇒ 304
 }
 ```
 
