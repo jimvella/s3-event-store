@@ -64,6 +64,13 @@ export interface AppendOptions {
 }
 
 export interface EventStore {
+  /**
+   * The chunk/bucket width this store compacts to — the store-level constant N.
+   * Exposed so HTTP egress helpers can align page boundaries to chunk
+   * boundaries without a caller re-declaring N (DESIGN.md, "Page boundaries are
+   * a deterministic function of the version, aligned to chunk size N").
+   */
+  readonly chunkSize: number;
   append(streamId: string, events: EventInput[], opts: AppendOptions): Promise<AppendResult>;
   read(streamId: string, opts?: ReadOptions): AsyncIterable<EventEnvelope>;
   /** Resolve the current head version, or "noStream". Exposed for tests. */
@@ -701,5 +708,5 @@ export function createEventStore(config: EventStoreConfig): EventStore {
     return { deleted: garbage.length };
   }
 
-  return { append, read, resolveHead, compactStream, sweepStream };
+  return { chunkSize, append, read, resolveHead, compactStream, sweepStream };
 }

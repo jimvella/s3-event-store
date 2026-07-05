@@ -746,7 +746,11 @@ owns no process.
 library:
 
 - Command endpoints: authenticate → rehydrate (chunks + tail) → enforce
-  invariants → `append` → `waitUntil` compaction trigger.
+  invariants → `append` → `waitUntil` compaction trigger. Deployments
+  that skip domain commands and accept client-built events directly
+  should route the endpoint through `idempotentAppend` (stable event ids
+  + explicit `expectedVersion`), making client retries safe under
+  at-least-once delivery (see Prior art, EventStoreDB).
 - Read endpoints: events (plaintext or ciphertext per read model), key
   delivery (model B).
 
@@ -827,7 +831,20 @@ worker gets a natural hook for per-app policy — path-prefix middleware,
 outside the library.
 
 Live updates = polling `GET head` (full head resolution behind it — hint
-GET + short LIST + one anchor GET — short-TTL cacheable). SSE/WebSocket via Durable Objects is an optional deployment
+GET + short LIST + one anchor GET — short-TTL cacheable). The response
+carries a strong `ETag` derived from version space (`"v{head}"`, `"empty"`
+for an absent stream — never a storage ETag, which compaction changes
+without the logical head moving), so pollers revalidate with
+`If-None-Match` and the handler answers `304 Not Modified` while the head
+is unmoved — the poll loop costs a conditional request, not a body
+(EventStoreDB's AtomPub API demonstrated this contract; see Prior art).
+The head body is a pure function of the version given the route's fixed
+page size, which is what makes the version a valid strong validator.
+An optional middle rung between polling and SSE: a long-poll (the handler
+holds the request up to a client-named timeout, re-resolving the head
+server-side, responding the moment it advances) — same S3 cost, better
+latency, no Durable Objects; deployment-layer, evaluated under Prior art.
+SSE/WebSocket via Durable Objects is an optional deployment
 upgrade the library stays out of.
 
 ### Wire format
@@ -993,6 +1010,59 @@ conceded honestly:
   linearizability-checked, simulated object store) — read in detail
   2026-07; what transfers and what doesn't is worked through in
   [SIMULATOR_PLAN.md](SIMULATOR_PLAN.md).
+
+**EventStoreDB's AtomPub HTTP API** (GetEventStore → EventStoreDB →
+KurrentDB; the AtomPub surface is deprecated since v20, gRPC-first —
+surveyed 2026-07 from the archived docs). The direct ancestor of the wire
+format here, and the design already shares its load-bearing ideas
+independently: RFC 5005 archived pages (its immutable
+`max-age=31536000, public` older pages vs. `no-cache, must-revalidate`
+head page = the `complete` flag and immutable/no-store split), strict
+link-following ("never construct URLs except the head"), and
+`ES-ExpectedVersion`'s special values (`-2`/`-1` = `any`/`noStream`).
+Ironically it abandoned the HTTP feed for gRPC because it *has* a server;
+this design leans into it because it doesn't. Reviewed feature-by-feature
+for further borrowings:
+
+- **Adopted — `ETag`/`If-None-Match` → `304` on `GET head`** (see HTTP
+  reads): the version-derived strong validator that makes the poll loop
+  nearly free on the wire.
+- **Adopted — idempotent append on retry** (as the opt-in ingress helper
+  `idempotentAppend`). ESDB dedups by client-supplied event UUID:
+  re-POSTing after a timeout succeeds without a duplicate. Here,
+  driver-level lost responses are already recovered (the 412 → GET →
+  `commitId` comparison in append step 3), but an *application-level*
+  retry mints a fresh `commitId`, so it double-appends under `"any"` or
+  raises `ConcurrencyError` under an explicit version even though the
+  first attempt won. The helper closes it for the raw-append worker (the
+  deployment that accepts client-built events rather than domain
+  commands): on `ConcurrencyError` it reads the exact window the append
+  targeted and reports success iff every version holds the matching event
+  `id` — our own earlier win — else rethrows. Client contract: stable
+  event `id`s and the same explicit `expectedVersion` on retry;
+  `"any"` is refused (no deterministic window ⇒ a retry is
+  indistinguishable from an intentional duplicate). Domain-command
+  workers get idempotency at the command layer instead (command ids),
+  where the semantics belong.
+- **Evaluated, deferred — long-poll** (`ES-LongPoll: <seconds>`): the
+  middle rung between short-TTL polling and the Durable Objects SSE
+  upgrade — a held `GET head` re-resolving server-side. Same S3 request
+  cost, better latency, fewer round-trips; pure deployment-layer,
+  noted under HTTP reads.
+- **Rejected — client-chosen page size in the URL**
+  (`/{start}/forward/{count}`): every client mints bespoke cache keys —
+  exactly the edge-hit-rate collapse the fixed, chunk-aligned page URLs
+  exist to prevent. ESDB could absorb arbitrary windows because a server
+  answered every read; nothing absorbs them here.
+- **Rejected — `embed` modes / per-event URLs**: event-granular caching
+  at one round-trip per event vs. page-granular economics (cache, API,
+  and storage converge on the chunk). This API is permanently
+  `embed=body`; moot for model B anyway, where ciphertext ships
+  regardless.
+- **Rejected — retention metadata** (`$maxAge`/`$maxCount`/`$tb`):
+  policy deletion contradicts immutable cache-forever pages; erasure here
+  is crypto-shredding, designed to survive un-purgeable caches. `$acl` is
+  the worker's auth domain, not the library's.
 
 **Other candidates, and why they don't overlap:**
 
