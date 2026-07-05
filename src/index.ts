@@ -60,3 +60,12 @@ export type {
   ExpectedVersion,
   HeadHint,
 } from "./types.js";
+export {
+  DEFAULT_PAGE_SIZE,
+  canonicalFrom,
+  readPage,
+  toWireFeed,
+  type FeedPage,
+  type ReadPageOptions,
+  type WireFeedPage,
+} from "./http.js";
