@@ -22,7 +22,7 @@
 import type { StorageDriver } from "../driver.js";
 import { SubjectErasedError, TransientStoreError } from "../errors.js";
 import { base64ToBytes, bytesToBase64, cryptoRandom, type RandomFn } from "./bytes.js";
-import type { MasterKey } from "./master-key.js";
+import { wrapContext, type MasterKey } from "./master-key.js";
 
 export interface KeyringEntry {
   keyId: string;
@@ -142,9 +142,30 @@ export function createS3KeyStore(config: S3KeyStoreConfig): KeyStore {
     return Number(m[1]);
   }
 
-  async function unwrapObject(body: string): Promise<{ keyId: string; key: Uint8Array }> {
+  /**
+   * Unwrap a generation object. `subjectId` and `gen` come from the KEY
+   * PATH the object was fetched under, never from its body: the wrap
+   * context binds the key to that location, so a wrapped-key object
+   * grafted into another subject's prefix fails to unwrap rather than
+   * being delivered as that subject's key. The body check is
+   * belt-and-braces for a clearer error before the AAD failure would.
+   */
+  async function unwrapObject(
+    subjectId: string,
+    gen: number,
+    body: string,
+  ): Promise<{ keyId: string; key: Uint8Array }> {
     const obj = JSON.parse(body) as WrappedKeyObject;
-    return { keyId: obj.keyId, key: await masterKey.unwrap(base64ToBytes(obj.wrappedKey)) };
+    const keyId = keyIdOf(gen);
+    if (obj.subjectId !== subjectId || obj.keyId !== keyId) {
+      throw new TransientStoreError(
+        `key object at ${generationKey(subjectId, gen)} claims ${obj.subjectId}/${obj.keyId} — grafted or corrupt`,
+      );
+    }
+    return {
+      keyId,
+      key: await masterKey.unwrap(base64ToBytes(obj.wrappedKey), wrapContext(subjectId, keyId)),
+    };
   }
 
   /**
@@ -165,7 +186,7 @@ export function createS3KeyStore(config: S3KeyStoreConfig): KeyStore {
     const object: WrappedKeyObject = {
       subjectId,
       keyId,
-      wrappedKey: bytesToBase64(await masterKey.wrap(raw)),
+      wrappedKey: bytesToBase64(await masterKey.wrap(raw, wrapContext(subjectId, keyId))),
       createdAt: new Date(clock()).toISOString(),
     };
     const put = await driver.putIfAbsent(generationKey(subjectId, gen), JSON.stringify(object));
@@ -193,7 +214,7 @@ export function createS3KeyStore(config: S3KeyStoreConfig): KeyStore {
       const newest = gens[gens.length - 1]!;
       const got = await driver.get(newest.key, { ifMatch: newest.etag });
       if (got.kind !== "found") continue; // shredded or changed under us; re-list
-      return unwrapObject(got.body);
+      return unwrapObject(subjectId, genOf(newest.key), got.body);
     }
     throw new TransientStoreError(`current-key resolution for ${subjectId} kept losing races`);
   }
@@ -224,7 +245,7 @@ export function createS3KeyStore(config: S3KeyStoreConfig): KeyStore {
       if (cached && clock() - cached.at < keyCacheTtl) return cached.key;
       const got = await driver.get(generationKey(subjectId, Number(keyId)));
       if (got.kind !== "found") return null; // shredded: fail closed
-      const { key } = await unwrapObject(got.body);
+      const { key } = await unwrapObject(subjectId, Number(keyId), got.body);
       keyCache.set(cacheKey, { key, at: clock() });
       return key;
     },
@@ -238,7 +259,7 @@ export function createS3KeyStore(config: S3KeyStoreConfig): KeyStore {
       for (const g of gens) {
         const got = await driver.get(g.key, { ifMatch: g.etag });
         if (got.kind !== "found") continue; // shredded mid-listing
-        const { keyId, key } = await unwrapObject(got.body);
+        const { keyId, key } = await unwrapObject(subjectId, genOf(g.key), got.body);
         entries.push({ keyId, key, expiresAt });
       }
       return entries;

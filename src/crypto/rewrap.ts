@@ -15,8 +15,15 @@
  */
 
 import type { StorageDriver } from "../driver.js";
-import type { MasterKey } from "./master-key.js";
+import { wrapContext, type MasterKey } from "./master-key.js";
 import { base64ToBytes, bytesToBase64 } from "./bytes.js";
+
+/** Wrap context from the KEY PATH (never the body — a grafted object's
+ * body claims the location it was copied from). */
+function contextOf(key: string): string | null {
+  const m = /^keys\/(.+)\/(\d{6})\.json$/.exec(key);
+  return m ? wrapContext(m[1]!, m[2]!) : null;
+}
 
 export interface RewrapReport {
   /** Rewrapped from `from` to `to` this run. */
@@ -48,23 +55,31 @@ export async function rewrapKeys(opts: {
         report.skipped++; // shredded since the LIST
         continue;
       }
+      const context = contextOf(listed.key);
+      if (context === null) {
+        report.failed.push(listed.key); // foreign object in the key prefix
+        continue;
+      }
       const object = JSON.parse(got.body) as { wrappedKey: string } & Record<string, unknown>;
       const wrapped = base64ToBytes(object.wrappedKey);
 
       let raw: Uint8Array;
       try {
-        raw = await from.unwrap(wrapped);
+        raw = await from.unwrap(wrapped, context);
       } catch {
         try {
-          await to.unwrap(wrapped);
+          await to.unwrap(wrapped, context);
           report.alreadyCurrent++; // a prior partial run got here first
         } catch {
-          report.failed.push(listed.key);
+          report.failed.push(listed.key); // neither master, or grafted: investigate
         }
         continue;
       }
 
-      const rewrapped = JSON.stringify({ ...object, wrappedKey: bytesToBase64(await to.wrap(raw)) });
+      const rewrapped = JSON.stringify({
+        ...object,
+        wrappedKey: bytesToBase64(await to.wrap(raw, context)),
+      });
       const cas = await driver.putIfMatch(listed.key, rewrapped, got.etag);
       if (cas.kind === "updated") {
         report.rewrapped++;

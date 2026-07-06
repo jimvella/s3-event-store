@@ -6,7 +6,9 @@
 
 import { describe, expect, it } from "vitest";
 import { ShreddedDataError, SubjectErasedError } from "../src/errors";
+import { cryptoRandom } from "../src/crypto/bytes";
 import { aesMasterKey } from "../src/crypto/master-key";
+import { decryptPayload, encryptPayload, payloadAad } from "../src/crypto/payload";
 import {
   createS3KeyStore,
   generationKey,
@@ -421,6 +423,86 @@ describe("master-key re-wrap", () => {
     const report = await running;
     expect(report).toEqual({ rewrapped: 0, alreadyCurrent: 0, skipped: 1, failed: [] });
     // The resurrection guard: the shredded key stays deleted.
+    expect(keySim.dump().has(generationKey(SUBJECT, 0))).toBe(false);
+  });
+});
+
+describe("context binding (AAD)", () => {
+  it("rejects ciphertext transplanted to another stream or generation, even under the same key", async () => {
+    const key = cryptoRandom(32);
+    const aad = payloadAad("user-1", "000000");
+    const ct = await encryptPayload(
+      key,
+      { secretText: "alpha" },
+      { compress: true, random: cryptoRandom, aad },
+    );
+    expect(await decryptPayload(key, ct, aad)).toEqual({ secretText: "alpha" });
+    // Same key, foreign stream / foreign generation: fails authentication
+    // instead of decrypting cleanly in the wrong context.
+    await expect(decryptPayload(key, ct, payloadAad("user-2", "000000"))).rejects.toThrow(
+      ShreddedDataError,
+    );
+    await expect(decryptPayload(key, ct, payloadAad("user-1", "000001"))).rejects.toThrow(
+      ShreddedDataError,
+    );
+  });
+
+  it("a wrapped key grafted into another subject's prefix fails to unwrap — key delivery never hands over a foreign key", async () => {
+    const { keys, keyDriver } = setup();
+    await keys.currentKey(SUBJECT); // mint subject:user-1 generation 0
+    const stolen = await keyDriver.get(generationKey(SUBJECT, 0));
+    if (stolen.kind !== "found") throw new Error("expected the wrapped key object");
+
+    // Naive graft — copy the object verbatim: the body/path cross-check fires.
+    await keyDriver.putIfAbsent(generationKey("subject:user-2", 0), stolen.body);
+    await expect(keys.keyById("subject:user-2", "000000")).rejects.toThrow(/grafted or corrupt/);
+
+    // Doctored graft — body rewritten to claim the target location: the
+    // wrap context (bound at mint, derived from the key path) fails the
+    // unwrap; neither keyById nor keyring ever delivers the foreign key.
+    const doctored = JSON.stringify({
+      ...(JSON.parse(stolen.body) as Record<string, unknown>),
+      subjectId: "subject:user-3",
+    });
+    await keyDriver.putIfAbsent(generationKey("subject:user-3", 0), doctored);
+    await expect(keys.keyById("subject:user-3", "000000")).rejects.toThrow();
+    await expect(keys.keyring("subject:user-3")).rejects.toThrow();
+
+    // The legitimate owner is unaffected.
+    expect(await keys.keyById(SUBJECT, "000000")).not.toBeNull();
+  });
+});
+
+describe("sweeper config re-verification", () => {
+  it("re-verifies the key bucket immediately before the first hard delete; a failure aborts before anything is destroyed", async () => {
+    const { keys, keySim, clockRef, shredCtx } = setup();
+    await keys.currentKey(SUBJECT); // mint generation 0
+    await requestShred(shredCtx, SUBJECT);
+    clockRef.now += 15 * DAY;
+
+    let checks = 0;
+    await expect(
+      sweepShreds({
+        ...shredCtx,
+        verifyKeyBucketConfig: async () => {
+          checks++;
+          throw new Error("key bucket versioning is Enabled");
+        },
+      }),
+    ).rejects.toThrow(/versioning is Enabled/);
+    expect(checks).toBe(1);
+    // Config drift blocked the destruction: the generation survives.
+    expect(keySim.dump().has(generationKey(SUBJECT, 0))).toBe(true);
+
+    // A later run against a fixed bucket resumes idempotently and completes.
+    const report = await sweepShreds({
+      ...shredCtx,
+      verifyKeyBucketConfig: async () => {
+        checks++;
+      },
+    });
+    expect(report.hardDeleted).toEqual([SUBJECT]);
+    expect(checks).toBe(2);
     expect(keySim.dump().has(generationKey(SUBJECT, 0))).toBe(false);
   });
 });

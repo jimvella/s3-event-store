@@ -30,6 +30,16 @@ export interface ShredContext {
   waitingPeriodMs: number;
   /** ms epoch; injectable for deterministic tests. */
   clock?: () => number;
+  /**
+   * Re-verification of the key bucket's inverted configuration, run once
+   * per sweep immediately before the first hard delete (config can drift
+   * after startup: versioning enabled later silently turns hard deletes
+   * into delete markers — `ShredCompleted` would record an erasure that
+   * never happened). Pass `() => verifyKeyBucketConfig(client, bucket)`
+   * on S3; omit on R2 (no versioning/replication APIs — unversioned by
+   * construction). A throw aborts the sweep before anything is deleted.
+   */
+  verifyKeyBucketConfig?: () => Promise<void>;
 }
 
 interface OpenIntent {
@@ -210,6 +220,15 @@ export async function sweepShreds(ctx: ShredContext): Promise<SweepReport> {
 
   const report: SweepReport = { hardDeleted: [], reconciledCancellations: [], openSubjects: [] };
 
+  // Key-bucket config re-check, lazily, at the moment of destruction —
+  // startup verification alone would miss drift (see ShredContext).
+  let configVerified = false;
+  async function verifyBeforeDelete(): Promise<void> {
+    if (configVerified || ctx.verifyKeyBucketConfig === undefined) return;
+    await ctx.verifyKeyBucketConfig();
+    configVerified = true;
+  }
+
   // Drive each subject with open intents.
   const bySubject = new Map<string, OpenIntent[]>();
   for (const intent of open) {
@@ -255,6 +274,7 @@ export async function sweepShreds(ctx: ShredContext): Promise<SweepReport> {
     // Hard delete (step 3 tail) + re-list-to-confirm-empty (step 4). The
     // point of irrecoverability. Re-list loop terminates: only mints in
     // flight at tombstone creation can land strays.
+    await verifyBeforeDelete();
     for (let round = 0; round < 10; round++) {
       const generations = await listPrefix(driver, `keys/${subjectId}/`);
       if (generations.length === 0) break;

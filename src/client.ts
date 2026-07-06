@@ -19,7 +19,7 @@
 
 import { ShreddedDataError } from "./errors.js";
 import { base64ToBytes } from "./crypto/bytes.js";
-import { decryptPayload } from "./crypto/payload.js";
+import { decryptPayload, payloadAad } from "./crypto/payload.js";
 import type { EventEnvelope } from "./types.js";
 
 /** Wire page (DESIGN.md, Wire format). */
@@ -153,7 +153,11 @@ export function createStreamClient(config: StreamClientConfig): StreamClient {
         if (event.version < from) continue; // canonical page starts before the cursor
         const data =
           event.keyId !== undefined
-            ? await decryptPayload(await keyFor(streamId, event.keyId), event.data as string)
+            ? await decryptPayload(
+                await keyFor(streamId, event.keyId),
+                event.data as string,
+                payloadAad(streamId, event.keyId),
+              )
             : event.data;
         let envelope: EventEnvelope = { ...event, data };
         for (const upcast of upcasters) envelope = upcast(envelope);

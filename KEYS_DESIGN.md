@@ -98,7 +98,13 @@ all bucket-level settings, on for events, off for keys):
   fit the deadline together (a 14-day wait leaves roughly two weeks for
   retention; see Shred propagation rule).
 - **Keys stored wrapped** by a master key (AWS KMS, or a configured secret on
-  R2, which has no KMS) — a bucket leak then discloses nothing.
+  R2, which has no KMS) — a bucket leak then discloses nothing. Wrapping
+  binds a **context** — `{subjectId}/{keyId}`, derived from the object's
+  key path, never from its body (body fields travel with a grafted copy;
+  the path does not) — so a wrapped-key object copied into another
+  subject's prefix fails to unwrap instead of being delivered as that
+  subject's key through key delivery. GCM AAD in the shipped
+  implementation; a KMS-backed store maps it to `EncryptionContext`.
 - **Strict IAM separation + audit logging** — ideally a separate account; the
   principal that reads event ciphertext must not enumerate keys, and key
   deletions need an audit trail you can show a regulator.
@@ -446,6 +452,17 @@ plaintext) is the v1 choice:
   tags). Random nonces bound safe use to ~2³² encryptions per key (NIST
   collision margin); treat that ceiling as an input to rotation cadence —
   mint a new generation long before any key approaches it.
+- **Context binding (AAD).** Every ciphertext is bound to
+  `{streamId}\n{keyId}` as GCM additional authenticated data: a valid
+  ciphertext transplanted to another stream, subject, or generation fails
+  authentication instead of decrypting cleanly in the wrong place —
+  without it, anyone (or any bug) able to write commit objects could
+  relocate ciphertext undetected. The event **version is deliberately not
+  bound**: serialization precedes version assignment, and a retried
+  conditional PUT must carry byte-identical content. The accepted
+  residual is therefore duplication of a ciphertext at another version of
+  the *same stream* under the *same generation* — available only to an
+  actor who can already write that stream's commit objects.
 - **Length sits outside the encryption boundary.** Compress-before-encrypt
   makes ciphertext length ≈ compressed plaintext length, so payload size
   and compressibility leak through object sizes and page bytes to anything
@@ -565,6 +582,16 @@ the tombstone via step 2 on its behalf. If that CAS 412s against
 `committing`, a mid-flight sweep had already won the commit point before
 the cancellation was appended; the audit trail then truthfully reads
 Cancelled-then-Completed — the cancellation was requested, and it lost.
+Immediately before its first hard delete of a run, the sweeper
+**re-verifies the key bucket's inverted configuration** (the same checks
+as startup: versioning never enabled, no replication, no Object Lock).
+Startup verification alone misses drift — versioning enabled *after*
+startup silently turns every hard delete into a delete marker, and
+`ShredCompleted` would then record an erasure that never happened. A
+failed re-check aborts the sweep before anything is destroyed; the
+tombstone state is resumable, so the next run against a fixed bucket
+completes idempotently. (S3 only; R2 has no versioning or replication
+APIs and is unversioned by construction.)
 The clock is not incidental but the design: every hard delete is
 sweeper-executed, so the waiting period needs no scheduler beyond the job
 that already exists, and a crashed shred is just an open intent the next

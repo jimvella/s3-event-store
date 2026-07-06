@@ -16,7 +16,7 @@ import { ShreddedDataError } from "../errors.js";
 import type { PayloadSerializer } from "../serializer.js";
 import { cryptoRandom, type RandomFn } from "./bytes.js";
 import type { KeyStore } from "./keystore.js";
-import { decryptPayload, encryptPayload } from "./payload.js";
+import { decryptPayload, encryptPayload, payloadAad } from "./payload.js";
 
 export interface EncryptingSerializerConfig {
   keys: KeyStore;
@@ -49,7 +49,17 @@ export function encryptingSerializer(config: EncryptingSerializerConfig): Payloa
       // Fails closed (SubjectErasedError) on a soft-deleted subject —
       // the append path's tombstone consult, before any PUT.
       const { keyId, key } = await config.keys.currentKey(subjectId);
-      return { data: await encryptPayload(key, event.data, { compress, random }), keyId };
+      // AAD binds the ciphertext to its stream and generation: transplanted
+      // ciphertext fails authentication instead of decrypting in the wrong
+      // context (see crypto/payload.ts).
+      return {
+        data: await encryptPayload(key, event.data, {
+          compress,
+          random,
+          aad: payloadAad(streamId, keyId),
+        }),
+        keyId,
+      };
     },
 
     async deserialize(streamId, envelope) {
@@ -66,7 +76,7 @@ export function encryptingSerializer(config: EncryptingSerializerConfig): Payloa
           `key ${envelope.keyId} for subject ${subjectId} is shredded or undeliverable`,
         );
       }
-      return decryptPayload(key, envelope.data as string);
+      return decryptPayload(key, envelope.data as string, payloadAad(streamId, envelope.keyId));
     },
   };
 }
