@@ -4,6 +4,16 @@ Event sourcing directly on Amazon S3 — no database, no server, no resident
 process. A TypeScript library with zero runtime dependencies that runs
 anywhere from Node to Cloudflare Workers.
 
+## Preamble
+
+Why does this library exist? Because I'm cheap. Nothing beats S3/R2 on cost, so a serverless app built on short-lived workers with nothing but object storage for persistence is appealing economically.
+
+Event sourcing with archive feeds is a great way to propagate data in multi-user apps, and it became a practical option when S3 introduced conditional writes at the end of 2024. There are pitfalls, so this library codifies the approach as a hedge against them.
+
+Using only object storage does mean tradeoffs, particularly around latency — for example, accepting a few seconds of polling lag to avoid the cost and complexity of Cloudflare Durable Objects, HTTP long-polling, or websockets.
+
+Built with my initial Fable credits.
+
 ## Introduction
 
 `s3-event-store` implements a full event store — append with optimistic
