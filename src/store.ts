@@ -34,7 +34,8 @@ export interface EventStoreConfig {
   /**
    * N: chunk bucket width and per-commit event cap. Store-level constant —
    * chunk keys derive from it; changing it under existing data means full
-   * recompaction.
+   * recompaction. Defaults to 20; see CHUNK_SIZING_GUIDE.md for how to pick a
+   * value for your workload (the default is tuned for short, poll-read streams).
    */
   chunkSize?: number;
   /** Injectable id source (commitId, event ids) — deterministic under sim. */
@@ -103,7 +104,7 @@ export type HeadResolution =
 export function createEventStore(config: EventStoreConfig): EventStore {
   const driver = config.driver;
   const prefix = config.prefix;
-  const chunkSize = config.chunkSize ?? 500;
+  const chunkSize = config.chunkSize ?? 20;
   const ids = config.ids ?? (() => globalThis.crypto.randomUUID());
   const clock = config.clock ?? (() => new Date().toISOString());
   const maxRetries = config.maxRetries ?? 5;

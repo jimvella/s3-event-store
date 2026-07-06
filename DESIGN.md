@@ -319,30 +319,37 @@ coordination.
 
 Buckets are fixed windows over base-version space and never resize — that
 determinism is what lets uncoordinated compactors compute identical chunk
-keys. Commits are capped at **N events** (enforced at append; an atomic
-append of 500+ events is beyond any reasonable use case), and the cap keeps
+keys. Commits are capped at **N events** (enforced at append — so N must be at
+least as large as your biggest atomic commit), and the cap keeps
 bucket space dense: a straddling commit's next base always lands in the
 immediately following bucket (base b ∈ [kN, kN+N−1] with count ≤ N ⇒ next
 base < (k+2)·N), so **no bucket is ever empty** and chunk keys are dense up
 to the compaction watermark. Readers still discover chunks by LISTing `c/`,
 never by key arithmetic — defense-in-depth, not a load-bearing assumption.
 
-**Chunk size N = 500, fixed per store.** The Workers deployment runs
-compaction inside `waitUntil`, which shares the invoking request's
-~1,000-subrequest budget (R2 binding calls count); one chunk costs ~N GETs +
-1 PUT + 1 batched DELETE, so N = 500 leaves headroom for the request's own
-work — which is always an append's few calls, since compaction is
-write-triggered only (see Scheduling). `compactStream` therefore compacts
-**at most one bucket per invocation**: a backlog of several sealed buckets
-(a long-idle stream healing, or adopting compaction over existing data)
-would blow the budget in one shot; the state-derived trigger drains a
-backlog across subsequent appends, and the queue variant is the
-bulk-migration path. `waitUntil`'s post-response wall-clock allowance
-(~30 s) bounds the GET phase. "Parallel" is really ~6-wide — Workers cap
-simultaneous open connections at 6 — so N = 500 GETs run as ~84 waves,
-roughly 4–5 s at typical R2 latencies: comfortable, but the connection
-width, not N, is the variable to re-check if chunk assembly ever nears
-the limit (verify whether R2 binding calls share the fetch cap).
+**Chunk size N is a configurable store-level constant; it defaults to 20.**
+The default is tuned for short, poll-read streams — a small N freezes feed
+pages into cacheable objects quickly and bounds the re-downloaded live tail
+(full rationale, cost model, and per-workload guidance:
+[CHUNK_SIZING_GUIDE.md](CHUNK_SIZING_GUIDE.md)). What follows is the *upper*
+bound on N — why, on Workers, you cannot simply make it huge.
+
+The Workers deployment runs compaction inside `waitUntil`, which shares the
+invoking request's ~1,000-subrequest budget (R2 binding calls count); one
+chunk costs ~N GETs + 1 PUT + 1 batched DELETE, so N must stay well under
+that budget to leave headroom for the request's own work — which is always an
+append's few calls, since compaction is write-triggered only (see
+Scheduling). `compactStream` compacts **at most one bucket per invocation**:
+a backlog of several sealed buckets (a long-idle stream healing, or adopting
+compaction over existing data) would otherwise risk the budget in one shot;
+the state-derived trigger drains a backlog across subsequent appends, and the
+queue variant is the bulk-migration path. `waitUntil`'s post-response
+wall-clock allowance (~30 s) bounds the GET phase. "Parallel" is really
+~6-wide — Workers cap simultaneous open connections at 6 — so N GETs run as
+~N/6 waves (a large N ≈ 500 is ~84 waves, roughly 4–5 s at typical R2
+latencies: comfortable, but the connection width, not N, is the variable to
+re-check if chunk assembly ever nears the limit; verify whether R2 binding
+calls share the fetch cap).
 N is a store-level constant: chunk keys and REST page URLs derive from
 it, so changing it under existing data means a full recompaction — pick once,
 record it in store config. N bounds request count, not bytes: the compactor
@@ -350,10 +357,10 @@ buffers a whole bucket while assembling its chunk, and a bucket can hold up
 to N commits (all single-event), so worst-case chunk size is N × the
 **per-commit byte cap**. The two caps are one constraint — **byteCap × N ≤
 compactor memory budget** — and must be picked together: against Workers'
-128 MB limit, N = 500 implies a cap of ~128 KB per commit, not megabytes
-(256 KB × 500 would already equal the entire limit, leaving no assembly
-headroom). Both live in store config alongside
-N; the cap also keeps REST page assembly cheap.
+128 MB limit a large N ≈ 500 would imply a cap of only ~128 KB per commit
+(256 KB × 500 already equals the entire limit, leaving no assembly headroom),
+whereas the default N = 20 leaves ample room. Both live in store config
+alongside N; the cap also keeps REST page assembly cheap.
 
 **Compactor steps (per stream):**
 
@@ -862,7 +869,7 @@ load-bearing ideas survive here without the XML.
 {
   "streamId": "order-123",
   "from": 0,
-  "to": 500,                 // exclusive: the page covers [from, to)
+  "to": 20,                  // exclusive: the page covers [from, to) — width N
   "complete": true,          // head moved past this page ⇒ frozen (events AND
                              // next link) ⇒ served with Cache-Control: immutable
   "events": [
@@ -870,7 +877,7 @@ load-bearing ideas survive here without the XML.
       "data": { … },         // model A — or "ciphertext": "base64…" in model B
       "meta": { "ts": "…", "correlationId": "…" } }
   ],
-  "next": "/streams/order-123/events?from=500",   // null ⇒ at head
+  "next": "/streams/order-123/events?from=20",    // null ⇒ at head
   "prev": null                                    // page k−1; null on page 0
 }
 ```
@@ -909,9 +916,9 @@ The head resource (`GET …/head`) is the second wire shape:
   *k−1* — a complete page's envelope *including its links* stays immutable
   and cache-forever (see Reverse reads).
 - **Redirect-to-canonical**: the one URL a client must construct is a cold
-  resume from a stored cursor (`?from=372`, mid-page). The read handler
+  resume from a stored cursor (`?from=12`, mid-page). The read handler
   responds `308` to the canonical page containing that version (`?from=0`
-  for page 0–499); the client SDK follows and skips locally to 372. One
+  for page 0–19 at N = 20); the client SDK follows and skips locally to 12. One
   redirect converts any entry point into the canonical URL space; everything
   after is link-following against permanent cache entries.
 - **Envelope field names are CloudEvents-compatible** (`id`, `type`, `time`,
@@ -926,7 +933,8 @@ The head resource (`GET …/head`) is the second wire shape:
 Escape hatches, documented but not default: **NDJSON** (one event per line,
 pagination via `Link` headers) if pages grow enough that streaming-parse
 matters; a **binary content-type** per page if base64 inflation ever matters.
-At N = 500 events per page, neither is needed.
+At the modest page sizes a small N implies, neither is needed; only a
+deliberately large N would make either worth enabling.
 
 ### Compaction and the API
 
