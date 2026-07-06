@@ -278,8 +278,8 @@ your handler answers immediately or holds and re-resolves is up to you.
 Long poll cuts **invocation count and latency**. It does **not** cut
 head-resolution cost — the server still re-resolves the head at roughly the
 polling cadence, so the number of bucket reads is about the same. If S3/R2
-head-resolution GETs are your cost floor, the levers are poll interval and N
-alignment, not long polling.
+head-resolution GETs are your cost floor, the levers are poll interval, N
+alignment, and **edge micro-caching the head** (below) — not long polling.
 
 ### The platform trade-off
 
@@ -292,14 +292,48 @@ Whether that is "more resources" depends entirely on how the platform bills:
 | **AWS Lambda** | Wall-clock GB-seconds | **More expensive.** One 25–30 s held-open invocation is billed for its full duration — roughly 20× the wall-clock of the short polls it replaces. Prefer short polling. |
 | **Long-running server / container** | Fixed capacity; concurrency-bound | Depends on connection ceiling. Thousands of parked requests tie up threads/memory (the classic C10K concern) unless the runtime is built for it (async I/O, event loop). |
 
+### Collapsing fan-out: micro-cache the head
+
+Poll interval and long poll both optimize *one client's* head-poll count. Neither
+touches the case that usually dominates a hot stream: **many clients polling the
+same head at once.** Every tick from every client is a distinct origin
+head-resolution (hint GET + short LIST + anchor GET), even though they would all
+get the identical answer.
+
+A short **shared-cache TTL on `GET …/head`** collapses them. The head is served
+`no-store` today (it moves on every append); switch it to a brief shared TTL —
+`Cache-Control: s-maxage=1, max-age=0` — and a CDN serves every poll landing in
+the same ~1 s window from one origin resolution, while browsers still revalidate
+so no client pins a stale head locally. This is the only lever that scales *down*
+with fan-out instead of up: 100 clients at a 2 s cadence cost ~50 origin
+resolutions/s without it, ~1/s with it.
+
+- **Orthogonal to the rest.** Interval and long poll cut *per-client* ticks; N
+  tunes the *body*; micro-caching cuts *origin head-resolutions under fan-out*.
+  Independent knobs.
+- **Latency cost** is the TTL, added on top of the poll interval — at 1 s it sits
+  inside the "few seconds of lag" this store already trades for (see the README
+  preamble).
+- **Platform-neutral.** Cloudflare Cache (with Tiered Cache for origin shielding)
+  and CloudFront both honor `s-maxage`. The one constraint: a shared cache keys on
+  URL and **cannot vary on `Authorization`**, so an authenticated head must be
+  authorized *before* the cache lookup and cached under a content-only (or
+  scope-embedded) key — never the bearer token. On Workers that is the Cache API
+  inside the handler you already run; on AWS it is a CloudFront-Function /
+  Lambda@Edge check or a signed URL. (Same auth-scoped-key rule as the plaintext
+  feed pages — see [DESIGN.md](DESIGN.md).)
+- **When it buys nothing:** one poller per stream (a per-user stream with a single
+  reader). The saving is proportional to concurrent readers of the *same* stream.
+
 **Practical guidance:**
 
 - **Cloudflare Workers + R2** (this library's home turf): long poll is a good
   middle rung — fewer invocations, near-instant latency, no extra
   infrastructure. It will not reduce your head-resolution GETs; tune those with
-  poll cadence and N.
+  poll cadence, N, and — under concurrent readers — head micro-caching.
 - **Lambda or wall-clock-billed compute**: short poll. Long poll inverts the
   economics — you pay for idle held-open time.
 - **Either way**, the dominant cost in a polling system is usually the
-  head-poll count, not the feed body. Long poll and poll interval optimize the
-  count; N optimizes the body. They are orthogonal — tune both.
+  head-poll count, not the feed body. Poll interval and long poll optimize *one
+  client's* count; micro-caching the head optimizes it across *concurrent*
+  clients; N optimizes the body. They are orthogonal — tune all three.
