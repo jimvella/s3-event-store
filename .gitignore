@@ -2,3 +2,11 @@ node_modules/
 dist/
 # real-backend conformance credentials — never commit
 conformance.local.json
+
+# secrets — never commit
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
