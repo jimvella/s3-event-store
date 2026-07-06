@@ -4,6 +4,8 @@ Event sourcing directly on Amazon S3 — no database, no server, no resident
 process. A TypeScript library with zero runtime dependencies that runs
 anywhere from Node to Cloudflare Workers.
 
+**See it running:** [s3-event-store-cloudflare-demo](https://github.com/jimvella/s3-event-store-cloudflare-demo) — a full Cloudflare Workers + R2 example.
+
 ## Preamble
 
 Why does this library exist? Because I'm cheap. Nothing beats S3/R2 on cost, so a serverless app built on short-lived workers with nothing but object storage for persistence is appealing economically.
