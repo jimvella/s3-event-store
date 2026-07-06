@@ -238,13 +238,22 @@ return Response.json(toWireFeed(page, hrefFor), {
   },
 });
 
-// GET …/head — the poll target; ETag makes an unchanged poll a free 304
+// GET …/head — the poll target. A brief shared TTL collapses fan-out: every
+// poll landing in the same ~1 s window is served from one origin head-
+// resolution, while max-age=0 keeps browsers revalidating so no client pins a
+// stale head. ETag still turns an unchanged poll into a free 304. (A shared
+// cache keys on URL and can't vary on Authorization — authorize before the
+// cache lookup and key on scope, never the token. See CHUNK_SIZING_GUIDE.md.)
+const headCacheControl = "s-maxage=1, max-age=0";
 const head = await readHead(store, id);
 if (request.headers.get("If-None-Match") === head.etag) {
-  return new Response(null, { status: 304, headers: { ETag: head.etag } });
+  return new Response(null, {
+    status: 304,
+    headers: { ETag: head.etag, "Cache-Control": headCacheControl },
+  });
 }
 return Response.json(toWireHead(head, hrefFor), {
-  headers: { ETag: head.etag, "Cache-Control": "no-cache" },
+  headers: { ETag: head.etag, "Cache-Control": headCacheControl },
 });
 
 // POST …/append — raw ingress (only if you expose append instead of domain

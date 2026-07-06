@@ -300,13 +300,16 @@ same head at once.** Every tick from every client is a distinct origin
 head-resolution (hint GET + short LIST + anchor GET), even though they would all
 get the identical answer.
 
-A short **shared-cache TTL on `GET …/head`** collapses them. The head is served
-`no-store` today (it moves on every append); switch it to a brief shared TTL —
-`Cache-Control: s-maxage=1, max-age=0` — and a CDN serves every poll landing in
-the same ~1 s window from one origin resolution, while browsers still revalidate
-so no client pins a stale head locally. This is the only lever that scales *down*
-with fan-out instead of up: 100 clients at a 2 s cadence cost ~50 origin
-resolutions/s without it, ~1/s with it.
+A short **shared-cache TTL on `GET …/head`** collapses them. The reference
+handler serves the head with `Cache-Control: s-maxage=1, max-age=0` (README,
+*Serving the feed*): a CDN serves every poll landing in the same ~1 s window
+from one origin resolution, while `max-age=0` keeps browsers revalidating so no
+client pins a stale head locally. Plain `no-cache` will not do this — it is
+storable but revalidate-always, so every poll still reaches origin; only a
+freshness lifetime collapses the fan-out. This is the only lever that scales
+*down* with fan-out instead of up: 100 clients at a 2 s cadence cost ~50 origin
+resolutions/s without it, ~1/s with it (with origin shielding — otherwise ~1/s
+per edge PoP).
 
 - **Orthogonal to the rest.** Interval and long poll cut *per-client* ticks; N
   tunes the *body*; micro-caching cuts *origin head-resolutions under fan-out*.
@@ -314,6 +317,11 @@ resolutions/s without it, ~1/s with it.
 - **Latency cost** is the TTL, added on top of the poll interval — at 1 s it sits
   inside the "few seconds of lag" this store already trades for (see the README
   preamble).
+- **Safe by construction.** The cache sits on the read/subscribe path only. The
+  append concurrency check never consults an HTTP-cached head — writers resolve
+  the head through the in-process cache and the protocol's own step-4 chunk
+  check ([store.ts](src/store.ts)) — so a stale-low cached head can only make a
+  *reader* lag by the TTL; it can never admit a bad append.
 - **Platform-neutral.** Cloudflare Cache (with Tiered Cache for origin shielding)
   and CloudFront both honor `s-maxage`. The one constraint: a shared cache keys on
   URL and **cannot vary on `Authorization`**, so an authenticated head must be
