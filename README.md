@@ -27,18 +27,21 @@ stores provide:
 2. **Conditional writes** — create-only PUT (`If-None-Match: *`) and
    compare-and-swap (`If-Match`).
 
-Every append is one immutable object written with a conditional PUT, so two
-writers targeting the same stream version can never both succeed — the
-bucket itself is the concurrency control. There is no broker, no lock
-service, and no metadata database to operate, scale, or keep consistent
-with the log.
+Every append is a compare-and-swap on the stream's live tail — one
+conditional PUT — so two writers targeting the same stream version can never
+both succeed: the bucket itself is the concurrency control. There is no
+broker, no lock service, and no metadata database to operate, scale, or keep
+consistent with the log.
 
-Because commits are immutable objects with deterministic keys, replays are
-edge-cacheable forever: a long stream read can be served almost entirely
-from CDN cache. Background compaction rewrites cold commits into chunk
-objects so deep replays stay cheap, and client-side encryption with
-crypto-shredding provides GDPR erasure on storage that can never be
-rewritten.
+A stream is stored as a sequence of chunk objects: the live tail is updated
+in place by CAS, and once a chunk fills it is sealed and immutable forever.
+Sealed chunks have deterministic, version-keyed URLs, so replays are
+edge-cacheable forever — a long read serves almost entirely from CDN cache —
+and client-side encryption with crypto-shredding provides GDPR erasure over
+ciphertext that is never re-encrypted. This mutable-tail layout is the
+default strategy; an immutable-object-per-commit strategy with background
+compaction is available per prefix for large-N, replay-heavy workloads (see
+[DESIGN.md](DESIGN.md)).
 
 **Supported backends:** Amazon S3, Cloudflare R2, MinIO — anything
 S3-compatible with strong consistency and conditional-write support.
@@ -56,7 +59,7 @@ service. Everything else is deployment code you own.
 
 | Component | What it is |
 |---|---|
-| **Core library** (`@jimvella/s3-event-store`) | Event store (`append`/`read`), storage-driver interface, error taxonomy, serializers (including the encrypting one), `KeyStore` interface, `compactStream()` + trigger check, shred workflow helpers |
+| **Core library** (`@jimvella/s3-event-store`) | Event store (`append`/`read`), pluggable storage strategy (mutable-tail default; immutable-chunk + `compactStream()` alternative), storage-driver interface, error taxonomy, serializers (including the encrypting one), `KeyStore` interface, shred workflow helpers |
 | **Storage drivers** (`./drivers/*`) | `aws-sdk` (Node, `@aws-sdk/client-s3` as optional peer), `r2-binding` (native Cloudflare Workers bindings — no SDK weight), `aws4fetch` (lightweight SigV4 for calling S3/R2 from Workers) |
 | **Browser client SDK** (`./client`) | Zero-dependency, WebCrypto-only reader for encrypted streams: keyring fetch/cache, per-event key selection, AES-GCM decrypt, cursor iteration, upcasting |
 | **Your application worker** | Thin HTTP handlers over the library: authenticate → rehydrate → enforce invariants → append. The library ships no routes — auth and invariants are domain concerns |
@@ -88,8 +91,9 @@ One bucket (or a prefix within one) is all the infrastructure the store
 needs:
 
 - **Amazon S3** — works out of the box. On versioned buckets, add a
-  lifecycle rule expiring noncurrent versions (compaction DELETEs otherwise
-  accumulate delete markers).
+  lifecycle rule expiring noncurrent versions (each tail CAS overwrite — and,
+  under the immutable-chunk strategy, each compaction DELETE — otherwise
+  leaves a noncurrent version behind).
 - **Cloudflare R2** — S3-compatible conditional PUTs; use the
   `r2-binding` driver in Workers or `aws-sdk` with an endpoint override
   elsewhere. Zero egress fees make it attractive for read-heavy replays.
@@ -118,9 +122,11 @@ import { S3Client } from "@aws-sdk/client-s3";
 const store = createEventStore({
   driver: awsSdkDriver({ client: new S3Client({}), bucket: "my-events" }),
   prefix: "prod",                  // env isolation / multi-tenancy
+  // strategy: mutableTail({ chunkSize: 20 }),  // default; N is per-stream (see DESIGN.md)
 });
 
-// First event in a new stream
+// First event in a new stream — a stream-creating append may pin this
+// stream's N with a `chunkSize` option; otherwise the store default applies.
 await store.append("order-123", [
   { type: "OrderPlaced", data: { sku: "widget", qty: 2 } },
 ], { expectedVersion: "noStream" });
@@ -181,11 +187,8 @@ export default {
 
     const result = await store.append(streamId, events, { expectedVersion });
 
-    // Write-driven compaction: cheap arithmetic check, work off the request path
-    if (store.shouldCompact(streamId, result)) {
-      ctx.waitUntil(store.compactStream(streamId));
-    }
-
+    // Default (mutable-tail) strategy: no compaction to schedule, no
+    // background work — the append is complete when it returns.
     return Response.json(result);
   },
 };
@@ -291,16 +294,23 @@ as decryption failure, never as stale plaintext.
 
 ## Design documents
 
-The full specification — append protocol, head discovery, compaction,
-failure-mode analysis, REST surface — is in [DESIGN.md](DESIGN.md).
-Client-side encryption, key management, rotation, and crypto-shredding
-erasure are specified in [KEYS_DESIGN.md](KEYS_DESIGN.md).
+The full specification — the mutable-tail append protocol, head discovery,
+per-stream chunk sizing, REST surface — is in [DESIGN.md](DESIGN.md). The
+alternative immutable-object + compaction strategy, with its full failure-mode
+analysis, is in [DESIGN_IMMUTABLE_CHUNK.md](DESIGN_IMMUTABLE_CHUNK.md); the
+tradeoff analysis between the two is in
+[DESIGN_MUTABLE_TAIL_PROPOSAL.md](DESIGN_MUTABLE_TAIL_PROPOSAL.md). Client-side
+encryption, key management, rotation, and crypto-shredding erasure are
+specified in [KEYS_DESIGN.md](KEYS_DESIGN.md).
 
 ## Status
 
-Pre-release. Implemented so far (`src/`): the core append/read protocol,
-head discovery with `head.json` hints and the in-process head cache,
-compaction (`compactStream` + sweep) with the write-driven trigger, the
+Pre-release. Implemented so far (`src/`): the default **mutable-tail**
+strategy — CAS-tail `append`/`read`, tail-derived head discovery, per-stream
+chunk sizing, and the in-process tail cache; the alternative
+**immutable-chunk** strategy — create-only commits plus compaction
+(`compactStream` + sweep) with the write-driven trigger — behind the
+per-prefix strategy seam; the
 three storage drivers (`aws-sdk`, `r2-binding`, `aws4fetch`) with a shared
 conformance suite (fake backends always; real endpoints via
 `conformance.local.json`), and the encryption layer per
@@ -313,8 +323,8 @@ startup config verification), and the crypto-shredding workflow
 `$system.key-audit`, tombstone CAS state machine, soft-delete waiting
 period, sweeper-executed hard delete). The deterministic simulation harness
 (`sim/`; see [SIMULATOR_PLAN.md](SIMULATOR_PLAN.md)) checks the full
-invariant set, including no-forged-heads and every-committed-event-readable
-after every mutation. Also done: the worker-facing
+invariant set against both strategies, including no-forged-heads and
+every-committed-event-readable after every mutation. Also done: the worker-facing
 HTTP surface (`src/http.ts`: `readPage`/`toWireFeed` chunk-aligned pages
 with the `complete ⇔ next` immutability invariant, `readHead`/`toWireHead`
 poll target with version-derived ETag for `If-None-Match` → 304, and

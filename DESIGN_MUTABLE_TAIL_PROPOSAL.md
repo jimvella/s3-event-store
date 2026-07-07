@@ -1,15 +1,17 @@
-# Mutable head chunk — proposal & analysis
+# Mutable tail chunk — proposal & analysis
 
-**Status: exploratory. Not on the roadmap.** This document analyses an
-alternative **storage strategy** — not a replacement protocol: maintaining
-the live tail of a stream as a **single mutable chunk object** updated by
-compare-and-swap, instead of the shipped strategy's
-one-immutable-object-per-commit plus background compaction
-([DESIGN.md](DESIGN.md)). It plugs in behind the same storage-driver
-contract and REST surface, selectable per store (per prefix) alongside the
-shipped strategy, so the two coexist rather than fork the codebase. It
-records the tradeoffs, feasibility, and economics so the decision can be
-revisited with the reasoning intact.
+**Status: adopted as the default strategy.** This document is the decision
+record and tradeoff analysis behind that choice. It weighs the mutable tail —
+maintaining the live tail of a stream as a **single mutable chunk object**
+updated by compare-and-swap — against the one-immutable-object-per-commit plus
+background compaction design, now the selectable alternative
+([DESIGN_IMMUTABLE_CHUNK.md](DESIGN_IMMUTABLE_CHUNK.md)). The mutable tail is
+specified as the default in [DESIGN.md](DESIGN.md); both plug in behind the
+same storage-driver contract and REST surface, selectable per store (per
+prefix). Throughout, **"the shipped strategy" refers to that immutable-chunk
+alternative** — the naming predates the adoption. The document records the
+tradeoffs, feasibility, and economics so the decision can be revisited with
+the reasoning intact.
 
 **TL;DR:** the mutable tail is feasible on both S3 and R2 and slots in as an
 **alternative storage strategy behind the existing driver contract** —
