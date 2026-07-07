@@ -7,7 +7,7 @@
  */
 
 import type { EventStore, HeadResolution } from "../src/store.js";
-import type { ChunkObject, CommitObject, EventEnvelope } from "../src/types.js";
+import type { ChunkObject, CommitObject, EventEnvelope, TailChunk } from "../src/types.js";
 import type { SimStore } from "./store.js";
 
 export type Outcome = "committed" | "rejected" | "indefinite";
@@ -226,6 +226,29 @@ export function storageInvariant(simStore: SimStore, oracle: Oracle, chunkSize: 
     for (const id of oracle.committedEventIds()) {
       if (!readable.has(id)) {
         throw new Error(`storage invariant: committed event ${id} is unreadable`);
+      }
+    }
+  };
+}
+
+/**
+ * The MutableTail storage invariant (DESIGN.md, Core mechanism): all history
+ * lives in chunk objects under `c/` and nothing is ever deleted, so every
+ * committed event must be present in some chunk at every instant. There is no
+ * `e/` tail and no freed-key class to reason about.
+ */
+export function mutableTailStorageInvariant(simStore: SimStore, oracle: Oracle): () => void {
+  return () => {
+    const readable = new Set<string>();
+    for (const [key, obj] of simStore.dump()) {
+      if (!/\/c\/\d{12}\.json$/.test(key)) continue;
+      for (const c of (JSON.parse(obj.body) as TailChunk).commits) {
+        for (const e of c.events) readable.add(e.id);
+      }
+    }
+    for (const id of oracle.committedEventIds()) {
+      if (!readable.has(id)) {
+        throw new Error(`mutable-tail storage invariant: committed event ${id} is unreadable`);
       }
     }
   };

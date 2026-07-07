@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 import type { StorageDriver } from "../src/driver";
 import { ConcurrencyError, TransientStoreError } from "../src/errors";
 import { chunkKey, chunkPrefix, commitKey } from "../src/keys";
-import { createEventStore, type EventStore } from "../src/store";
+import { createEventStore, immutableChunk, type EventStore } from "../src/store";
 import { SIM_PREFIX, directDriver, gatedDriver, runSim } from "./harness";
 import { Oracle, collect, resolveHeadChecked, storageInvariant } from "./oracle";
 import { SimStore } from "./store";
@@ -23,6 +23,7 @@ function makeStore(driver: StorageDriver, name: string): EventStore {
     driver,
     prefix: SIM_PREFIX,
     chunkSize: CHUNK_SIZE,
+    strategy: immutableChunk(),
     ids: () => `${name}#${n++}`,
     clock: () => "1970-01-01T00:00:00.000Z",
   });

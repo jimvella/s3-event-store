@@ -8,7 +8,7 @@
 import { describe, expect, it } from "vitest";
 import type { StorageDriver } from "../src/driver";
 import { headKey } from "../src/keys";
-import { createEventStore, type EventStore } from "../src/store";
+import { createEventStore, immutableChunk, type EventStore } from "../src/store";
 import type { HeadHint } from "../src/types";
 import { SIM_PREFIX, directDriver } from "./harness";
 import { collect } from "./oracle";
@@ -22,6 +22,7 @@ function makeStore(driver: StorageDriver, name: string, chunkSize = 500): EventS
     driver,
     prefix: SIM_PREFIX,
     chunkSize,
+    strategy: immutableChunk(),
     ids: () => `${name}#${n++}`,
     clock: () => "1970-01-01T00:00:00.000Z",
   });

@@ -9,9 +9,13 @@ const start = process.argv[3] ?? String(Math.floor(Math.random() * 2 ** 31));
 console.log(`sweeping ${count} seeds starting at ${start}`);
 console.log(`reproduce with: npm run sweep -- ${count} ${start}`);
 
-const result = spawnSync("npx", ["vitest", "run", "sim/sweep.test.ts"], {
-  stdio: "inherit",
-  shell: true,
-  env: { ...process.env, SWEEP_SEEDS: count, SWEEP_START: start },
-});
+const result = spawnSync(
+  "npx",
+  ["vitest", "run", "sim/sweep.test.ts", "sim/sweep-mutable-tail.test.ts"],
+  {
+    stdio: "inherit",
+    shell: true,
+    env: { ...process.env, SWEEP_SEEDS: count, SWEEP_START: start },
+  },
+);
 process.exit(result.status ?? 1);

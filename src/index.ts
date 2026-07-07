@@ -43,12 +43,17 @@ export {
 } from "./crypto/shred.js";
 export {
   createEventStore,
+  mutableTail,
+  immutableChunk,
   type AppendOptions,
   type CompactionResult,
   type EventStore,
   type EventStoreConfig,
   type HeadResolution,
+  type ImmutableChunkOptions,
+  type MutableTailOptions,
   type ReadOptions,
+  type StrategyConfig,
 } from "./store.js";
 export type {
   AppendResult,
@@ -59,6 +64,7 @@ export type {
   EventMeta,
   ExpectedVersion,
   HeadHint,
+  TailChunk,
 } from "./types.js";
 export {
   DEFAULT_PAGE_SIZE,

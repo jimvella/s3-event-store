@@ -40,13 +40,31 @@ export interface CommitObject {
   committedAt: string;
 }
 
-/** Chunk object: one compacted bucket of commits (DESIGN.md, Compaction). */
+/** Chunk object: one compacted bucket of commits (DESIGN_IMMUTABLE_CHUNK.md). */
 export interface ChunkObject {
   streamId: string;
   chunkBase: number;
   commits: CommitObject[];
   /** Key of the last commit in the chunk — seeds tail LISTs. */
   lastCommitKey: string;
+}
+
+/**
+ * Mutable-tail chunk body (DESIGN.md, "Core mechanism: the mutable tail").
+ * The last chunk under `c/` is the live tail, updated in place by CAS; earlier
+ * chunks are sealed. The roll policy (`n`, `byteCap`) travels in the body so
+ * every appender reads the same caps the CAS is conditioned on and agrees on
+ * the boundary (DESIGN.md, "Per-stream (and evolving) N").
+ */
+export interface TailChunk {
+  streamId: string;
+  /** Base version of the first commit; equals this object's key. */
+  chunkBase: number;
+  /** Roll policy: max commits per chunk (also the per-commit event cap). */
+  n: number;
+  /** Roll policy: max serialized bytes before a new chunk is minted. */
+  byteCap: number;
+  commits: CommitObject[];
 }
 
 export type ExpectedVersion = number | "any" | "noStream";

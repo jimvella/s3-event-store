@@ -5,7 +5,7 @@
  */
 
 import type { StorageDriver } from "../src/driver.js";
-import { createEventStore, type EventStore } from "../src/store.js";
+import { createEventStore, immutableChunk, type EventStore, type StrategyConfig } from "../src/store.js";
 import { createSimDriver } from "./driver.js";
 import { createRng, type Rng } from "./rng.js";
 import { Scheduler, type FaultPlan, type TraceEntry } from "./scheduler.js";
@@ -16,6 +16,8 @@ export interface SimOptions {
   chunkSize?: number;
   listPageSize?: number;
   faults?: FaultPlan;
+  /** Storage strategy under test. Defaults to `immutableChunk()`. */
+  strategy?: StrategyConfig;
 }
 
 export interface SimContext {
@@ -60,6 +62,7 @@ export async function runSim(
         driver,
         prefix: SIM_PREFIX,
         chunkSize,
+        strategy: opts.strategy ?? immutableChunk(),
         ids: () => `${name}#${idCounter++}`,
         clock: () => scheduler.now(),
       });
@@ -88,7 +91,7 @@ export async function runSim(
     trace: scheduler.trace,
     traceText: scheduler.traceText(),
     simStore,
-    quiescent: quiescentStore(simStore, chunkSize),
+    quiescent: quiescentStore(simStore, chunkSize, opts.strategy),
   };
 }
 
@@ -105,12 +108,17 @@ export function directDriver(store: SimStore): StorageDriver {
   };
 }
 
-export function quiescentStore(simStore: SimStore, chunkSize: number): EventStore {
+export function quiescentStore(
+  simStore: SimStore,
+  chunkSize: number,
+  strategy?: StrategyConfig,
+): EventStore {
   let idCounter = 0;
   return createEventStore({
     driver: directDriver(simStore),
     prefix: SIM_PREFIX,
     chunkSize,
+    strategy: strategy ?? immutableChunk(),
     ids: () => `quiescent#${idCounter++}`,
     clock: () => new Date(0).toISOString(),
   });

@@ -25,7 +25,7 @@ import {
   type ShredContext,
 } from "../src/crypto/shred";
 import { verifyKeyBucketConfig } from "../src/drivers/aws-sdk";
-import { createEventStore } from "../src/store";
+import { createEventStore, immutableChunk, type StrategyConfig } from "../src/store";
 import { SIM_PREFIX, directDriver } from "./harness";
 import { collect } from "./oracle";
 import { SimStore } from "./store";
@@ -33,7 +33,12 @@ import { SimStore } from "./store";
 const DAY = 24 * 3600 * 1000;
 const SECRET = new Uint8Array(32).fill(7);
 
-function setup(opts?: { keyCacheTtlMs?: number; tombstoneTtlMs?: number; waitingPeriodMs?: number }) {
+function setup(opts?: {
+  keyCacheTtlMs?: number;
+  tombstoneTtlMs?: number;
+  waitingPeriodMs?: number;
+  strategy?: StrategyConfig;
+}) {
   const eventSim = new SimStore();
   const keySim = new SimStore();
   const clockRef = { now: 1_000_000_000 };
@@ -70,6 +75,7 @@ function setup(opts?: { keyCacheTtlMs?: number; tombstoneTtlMs?: number; waiting
     driver: directDriver(eventSim),
     prefix: SIM_PREFIX,
     chunkSize: 2,
+    ...(opts?.strategy ? { strategy: opts.strategy } : {}),
     ids,
     clock: isoClock,
     serializer,
@@ -148,7 +154,7 @@ describe("encrypting serializer end to end", () => {
   });
 
   it("compaction copies ciphertext verbatim — encrypted streams decrypt after compaction", async () => {
-    const { store } = setup();
+    const { store } = setup({ strategy: immutableChunk() });
     await store.append("user-1", [{ type: "T", data: "v0", id: "e0" }], { expectedVersion: "noStream" });
     for (let v = 0; v < 4; v++) {
       await store.append("user-1", [{ type: "T", data: `v${v + 1}`, id: `e${v + 1}` }], {

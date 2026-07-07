@@ -27,6 +27,7 @@ import type {
   ExpectedVersion,
   HeadHint,
 } from "./types.js";
+import { createMutableTailStore, DEFAULT_BYTE_CAP } from "./mutable-tail.js";
 
 export interface EventStoreConfig {
   driver: StorageDriver;
@@ -51,6 +52,40 @@ export interface EventStoreConfig {
    * ($system.key-audit). The external surface must keep rejecting them.
    */
   allowReservedStreams?: boolean;
+  /**
+   * Storage strategy (DESIGN.md, Storage strategies). Default: `mutableTail()`.
+   * Use `immutableChunk()` for large-N, replay-heavy workloads.
+   */
+  strategy?: StrategyConfig;
+}
+
+export interface MutableTailOptions {
+  /** Default N (max commits per chunk) for streams in this store. */
+  chunkSize?: number;
+  /** Default byte cap before a chunk rolls. */
+  byteCap?: number;
+  /** Per-stream policy override, consulted only when a chunk is minted
+   * (DESIGN.md, Configuring N). Returning undefined ⇒ propagate the tail. */
+  policyFor?: (streamId: string) => { chunkSize?: number; byteCap?: number } | undefined;
+}
+
+export interface ImmutableChunkOptions {
+  /** N: chunk bucket width and per-commit event cap. */
+  chunkSize?: number;
+}
+
+export type StrategyConfig =
+  | ({ kind: "mutableTail" } & MutableTailOptions)
+  | ({ kind: "immutableChunk" } & ImmutableChunkOptions);
+
+/** The default strategy: the mutable tail (DESIGN.md, Core mechanism). */
+export function mutableTail(opts: MutableTailOptions = {}): StrategyConfig {
+  return { kind: "mutableTail", ...opts };
+}
+
+/** The alternative: immutable commits + compaction (DESIGN_IMMUTABLE_CHUNK.md). */
+export function immutableChunk(opts: ImmutableChunkOptions = {}): StrategyConfig {
+  return { kind: "immutableChunk", ...opts };
 }
 
 export interface ReadOptions {
@@ -62,6 +97,13 @@ export interface ReadOptions {
 
 export interface AppendOptions {
   expectedVersion: ExpectedVersion;
+  /**
+   * MutableTail only, honored only on the stream-creating append: pin this
+   * stream's N / byte cap into its first chunk (DESIGN.md, Configuring N).
+   * Ignored by ImmutableChunk and on non-creating appends.
+   */
+  chunkSize?: number;
+  byteCap?: number;
 }
 
 export interface EventStore {
@@ -102,9 +144,20 @@ export type HeadResolution =
   | { kind: "head"; version: number; lastCommitKey: string; lastCommitEtag: string };
 
 export function createEventStore(config: EventStoreConfig): EventStore {
+  const strategy = config.strategy ?? mutableTail();
+  if (strategy.kind === "mutableTail") {
+    return createMutableTailStore(config, {
+      chunkSize: strategy.chunkSize ?? config.chunkSize ?? 20,
+      byteCap: strategy.byteCap ?? DEFAULT_BYTE_CAP,
+      ...(strategy.policyFor ? { policyFor: strategy.policyFor } : {}),
+    });
+  }
+  return createImmutableChunkStore(config, strategy.chunkSize ?? config.chunkSize ?? 20);
+}
+
+function createImmutableChunkStore(config: EventStoreConfig, chunkSize: number): EventStore {
   const driver = config.driver;
   const prefix = config.prefix;
-  const chunkSize = config.chunkSize ?? 20;
   const ids = config.ids ?? (() => globalThis.crypto.randomUUID());
   const clock = config.clock ?? (() => new Date().toISOString());
   const maxRetries = config.maxRetries ?? 5;
