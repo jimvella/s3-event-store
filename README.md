@@ -305,7 +305,8 @@ specified in [KEYS_DESIGN.md](KEYS_DESIGN.md).
 
 ## Status
 
-Pre-release. Implemented so far (`src/`): the default **mutable-tail**
+Published on npm as `@jimvella/s3-event-store` (0.x, pre-1.0 — the API may
+still change). Implemented so far (`src/`): the default **mutable-tail**
 strategy — CAS-tail `append`/`read`, tail-derived head discovery, per-stream
 chunk sizing, and the in-process tail cache; the alternative
 **immutable-chunk** strategy — create-only commits plus compaction
@@ -333,8 +334,7 @@ the exact target window); the browser client SDK (`./client` —
 keyring fetch/TTLs, local AES-GCM decryption, link-following with
 permanent complete-page caching, upcasters, fold) and the build plumbing
 (`npm run build`: tsup dual ESM/CJS + `.d.ts` for all five subpath
-exports; SDKs as optional peers). The package stays `private: true` until
-a publish decision. Still ahead per [DESIGN.md](DESIGN.md#roadmap):
+exports; SDKs as optional peers). Still ahead per [DESIGN.md](DESIGN.md#roadmap):
 MinIO/testcontainers conformance (deferred — real S3 and R2 are covered by
 the file-configured run below), an in-Workers conformance run for the
 r2-binding driver's `onlyIf` semantics, and demand-gated field-level
