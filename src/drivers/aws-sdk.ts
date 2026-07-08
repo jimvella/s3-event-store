@@ -19,6 +19,11 @@ import {
   ListObjectsV2Command,
   PutObjectCommand,
 } from "@aws-sdk/client-s3";
+
+// Everything the store writes is JSON; stamp it so bucket consoles and any
+// direct consumer see the right type (cosmetic to the store itself, which
+// never reads content types).
+const JSON_TYPE = "application/json";
 import type {
   GetResult,
   ListPage,
@@ -143,7 +148,7 @@ export function awsSdkDriver(opts: AwsSdkDriverOptions): StorageDriver {
     async put(key, body): Promise<{ etag: string }> {
       try {
         const resp = (await client.send(
-          new PutObjectCommand({ Bucket: bucket, Key: key, Body: body }),
+          new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentType: JSON_TYPE }),
         )) as { ETag?: string };
         return { etag: resp.ETag ?? "" };
       } catch (err) {
@@ -154,7 +159,7 @@ export function awsSdkDriver(opts: AwsSdkDriverOptions): StorageDriver {
     async putIfAbsent(key, body): Promise<PutIfAbsentResult> {
       try {
         const resp = (await client.send(
-          new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, IfNoneMatch: "*" }),
+          new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, IfNoneMatch: "*", ContentType: JSON_TYPE }),
         )) as { ETag?: string };
         return { kind: "created", etag: resp.ETag ?? "" };
       } catch (err) {
@@ -166,7 +171,7 @@ export function awsSdkDriver(opts: AwsSdkDriverOptions): StorageDriver {
     async putIfMatch(key, body, etag): Promise<PutIfMatchResult> {
       try {
         const resp = (await client.send(
-          new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, IfMatch: etag }),
+          new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, IfMatch: etag, ContentType: JSON_TYPE }),
         )) as { ETag?: string };
         return { kind: "updated", etag: resp.ETag ?? "" };
       } catch (err) {

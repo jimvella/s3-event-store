@@ -21,6 +21,9 @@ import type {
 } from "../driver.js";
 import { TransientStoreError } from "../errors.js";
 
+// Everything the store writes is JSON (cosmetic to the store; see aws-sdk).
+const JSON_TYPE = "application/json";
+
 export interface Aws4FetchDriverOptions {
   accessKeyId: string;
   secretAccessKey: string;
@@ -108,20 +111,20 @@ export function aws4fetchDriver(opts: Aws4FetchDriverOptions): StorageDriver {
     },
 
     async put(key, body): Promise<{ etag: string }> {
-      const resp = await send("PUT", objectUrl(key), {}, body);
+      const resp = await send("PUT", objectUrl(key), { "content-type": JSON_TYPE }, body);
       if (!resp.ok) throw new TransientStoreError(`s3 http PUT ${key}: ${resp.status}`);
       return { etag: resp.headers.get("etag") ?? "" };
     },
 
     async putIfAbsent(key, body): Promise<PutIfAbsentResult> {
-      const resp = await send("PUT", objectUrl(key), { "if-none-match": "*" }, body);
+      const resp = await send("PUT", objectUrl(key), { "if-none-match": "*", "content-type": JSON_TYPE }, body);
       if (resp.status === 412) return { kind: "exists" };
       if (!resp.ok) throw new TransientStoreError(`s3 http PUT ${key}: ${resp.status}`);
       return { kind: "created", etag: resp.headers.get("etag") ?? "" };
     },
 
     async putIfMatch(key, body, etag): Promise<PutIfMatchResult> {
-      const resp = await send("PUT", objectUrl(key), { "if-match": etag }, body);
+      const resp = await send("PUT", objectUrl(key), { "if-match": etag, "content-type": JSON_TYPE }, body);
       if (resp.status === 412 || resp.status === 404) return { kind: "precondition-failed" };
       if (!resp.ok) throw new TransientStoreError(`s3 http PUT ${key}: ${resp.status}`);
       return { kind: "updated", etag: resp.headers.get("etag") ?? "" };

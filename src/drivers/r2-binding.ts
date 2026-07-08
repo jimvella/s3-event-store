@@ -23,6 +23,9 @@ import type {
 } from "../driver.js";
 import { TransientStoreError } from "../errors.js";
 
+// Everything the store writes is JSON (cosmetic to the store; see aws-sdk).
+const HTTP_METADATA = { contentType: "application/json" };
+
 /** R2's get returns a body-less object on precondition failure. */
 export interface R2ObjectLike {
   etag: string;
@@ -37,7 +40,10 @@ export interface R2BucketLike {
   put(
     key: string,
     value: string,
-    options?: { onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string } },
+    options?: {
+      onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string };
+      httpMetadata?: { contentType?: string };
+    },
   ): Promise<{ etag: string } | null>;
   list(options?: {
     prefix?: string;
@@ -69,14 +75,14 @@ export function r2BindingDriver(bucket: R2BucketLike): StorageDriver {
     },
 
     async put(key, body): Promise<{ etag: string }> {
-      const result = await run("put", () => bucket.put(key, body));
+      const result = await run("put", () => bucket.put(key, body, { httpMetadata: HTTP_METADATA }));
       if (result === null) throw new TransientStoreError("r2 put returned null unconditionally");
       return { etag: result.etag };
     },
 
     async putIfAbsent(key, body): Promise<PutIfAbsentResult> {
       const result = await run("putIfAbsent", () =>
-        bucket.put(key, body, { onlyIf: { etagDoesNotMatch: "*" } }),
+        bucket.put(key, body, { onlyIf: { etagDoesNotMatch: "*" }, httpMetadata: HTTP_METADATA }),
       );
       if (result === null) return { kind: "exists" };
       return { kind: "created", etag: result.etag };
@@ -84,7 +90,7 @@ export function r2BindingDriver(bucket: R2BucketLike): StorageDriver {
 
     async putIfMatch(key, body, etag): Promise<PutIfMatchResult> {
       const result = await run("putIfMatch", () =>
-        bucket.put(key, body, { onlyIf: { etagMatches: etag } }),
+        bucket.put(key, body, { onlyIf: { etagMatches: etag }, httpMetadata: HTTP_METADATA }),
       );
       if (result === null) return { kind: "precondition-failed" };
       return { kind: "updated", etag: result.etag };
