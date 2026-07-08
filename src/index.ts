@@ -20,9 +20,11 @@ export { jsonSerializer, type PayloadSerializer, type SerializedPayload } from "
 export { encryptingSerializer, type EncryptingSerializerConfig } from "./crypto/serializer.js";
 export {
   fieldEncryptingSerializer,
+  isFieldEnvelope,
   isShreddedField,
   SHREDDED_FIELD,
   type FieldEncryptingSerializerConfig,
+  type FieldEnvelope,
 } from "./crypto/field-serializer.js";
 export { decryptPayload, encryptPayload, fieldAad, payloadAad } from "./crypto/payload.js";
 export {

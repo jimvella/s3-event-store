@@ -30,6 +30,20 @@
  * — see {@link fieldAad}. The envelope's reserved `keyId` records the one
  * generation that encrypted the whole event.
  *
+ * Reads are marker-driven, not annotation-driven: `deserialize` decrypts
+ * whatever markers the stored event actually carries. The log is immutable
+ * but the config is not — annotations widened, narrowed, dropped, or
+ * migrated to `"plaintext"` since an event was written change nothing about
+ * how it reads back. Two write-time guards keep that sound, both checked
+ * before any key-store side effect:
+ *
+ *  - a plaintext value on an encrypted event may not take a reserved shape
+ *    ({$enc} / {$shredded}) — it would read back as ciphertext or as an
+ *    erasure that never happened;
+ *  - the subject must still resolve, unchanged, from the marker-substituted
+ *    data — annotating the subject-bearing field itself would make every
+ *    event permanently undecryptable (the log is immutable; refuse now).
+ *
  * Shredded fields degrade, they don't destroy the replay: when the key is
  * gone (soft- or hard-deleted), `deserialize` substitutes the reserved
  * {@link SHREDDED_FIELD} sentinel for each encrypted field instead of
@@ -38,14 +52,19 @@
  * serializer, whose stream has exactly one subject, correctly throws
  * instead). Ciphertext that fails authentication under a DELIVERED key is
  * different — that is tampering or a transplant, and stays loud
- * (ShreddedDataError from decryptPayload).
+ * (ShreddedDataError from decryptPayload). So is a keyId naming a
+ * generation that was never minted: the key store throws rather than
+ * returning null (a shred is provable by its surviving tombstone, so a
+ * rewritten keyId can never impersonate a lawful erasure — see
+ * KeyStore.keyById).
  *
  * Read models: `deserialize` here is model A (the worker decrypts). For
  * model B serve envelopes raw (`read(…, { raw: true })` / the HTTP page
  * helpers) and decrypt in the browser with `decryptPayload` + `fieldAad`
- * (exported from `./client` too); the shipped stream client's automatic
- * decryption remains whole-payload (its keyring is per-stream — per-subject
- * keyring delivery is deployment-owned).
+ * (exported from `./client` too); the shipped stream client decrypts field
+ * markers only through its deployment-supplied `fieldKeyFor` hook
+ * (per-subject key delivery is deployment-owned) and yields them raw
+ * without one.
  */
 
 import { SerializationError, ShreddedDataError } from "../errors.js";
@@ -72,11 +91,16 @@ export function isShreddedField(value: unknown): boolean {
   );
 }
 
-interface FieldEnvelope {
+/** The reserved on-wire marker an encrypted field's value is replaced by. */
+export interface FieldEnvelope {
   $enc: string;
 }
 
-function isFieldEnvelope(value: unknown): value is FieldEnvelope {
+/** True for a {@link FieldEnvelope} field marker. By shape — and the shape
+ * is trustworthy at rest: `serialize` refuses plaintext values that would
+ * collide with it (see module doc), so on an encrypted event marker-shaped
+ * ⇔ ciphertext. */
+export function isFieldEnvelope(value: unknown): value is FieldEnvelope {
   return (
     typeof value === "object" &&
     value !== null &&
@@ -101,6 +125,10 @@ export interface FieldEncryptingSerializerConfig {
    * fail closed: `serialize` throws. An empty field list is ambiguous
    * (annotated, yet indistinguishable from plaintext at rest) and is
    * rejected — say `"plaintext"` if that is what you mean.
+   *
+   * Annotations govern the WRITE side only. Reads decrypt whatever markers
+   * the stored event carries (see module doc), so changing an annotation
+   * never strands already-written ciphertext.
    */
   fields: Record<string, readonly string[] | "plaintext">;
   /**
@@ -155,14 +183,48 @@ export function fieldEncryptingSerializer(config: FieldEncryptingSerializerConfi
         );
       }
 
-      // Fails closed (SubjectErasedError) on a soft-deleted subject — the
-      // append path's tombstone consult, before any PUT.
-      const { keyId, key } = await config.keys.currentKey(subject);
+      // Every guard below runs before currentKey: a refused write must have
+      // zero side effects, and currentKey lazily mints a key and appends a
+      // KeyCreated audit event.
       const data = { ...(event.data as Record<string, unknown>) };
       for (const field of spec) {
         if (field.includes("\n")) {
           throw new SerializationError(`field name ${JSON.stringify(field)} would break AAD framing`);
         }
+      }
+      for (const [field, value] of Object.entries(data)) {
+        // Reserved shapes: reads are marker-driven, so a plaintext value
+        // shaped like a marker would read back as ciphertext (and a fake
+        // $shredded as an erasure that never happened). Annotated fields
+        // are exempt — they are about to become real markers.
+        if (spec.includes(field)) continue;
+        if (isFieldEnvelope(value) || isShreddedField(value)) {
+          throw new SerializationError(
+            `event type "${event.type}" field ${JSON.stringify(field)} is plaintext but shaped like ` +
+              `a reserved marker ({$enc}/{$shredded}) — it would be misread on replay`,
+          );
+        }
+      }
+      // The subject must survive marker substitution: deserialize resolves
+      // it from the STORED data, so a config that annotates the
+      // subject-bearing field would write events nobody can ever decrypt.
+      const probe = { ...data };
+      for (const field of spec) {
+        if (field in probe && probe[field] !== undefined) probe[field] = { $enc: "" };
+      }
+      const derived = await config.subjectFor({ type: event.type, data: probe });
+      if (derived !== subject) {
+        throw new SerializationError(
+          `event type "${event.type}": subjectFor resolves ${JSON.stringify(subject)} from the ` +
+            `plaintext event but ${JSON.stringify(derived ?? null)} once its fields are encrypted — ` +
+            `the subject-bearing field must stay plaintext (identifiers vs. attributes; see module doc)`,
+        );
+      }
+
+      // Fails closed (SubjectErasedError) on a soft-deleted subject — the
+      // append path's tombstone consult, before any PUT.
+      const { keyId, key } = await config.keys.currentKey(subject);
+      for (const field of spec) {
         const value = data[field];
         if (!(field in data) || value === undefined) continue;
         data[field] = {
@@ -179,19 +241,23 @@ export function fieldEncryptingSerializer(config: FieldEncryptingSerializerConfi
     async deserialize(streamId, envelope: EventEnvelope): Promise<unknown> {
       if (envelope.keyId === undefined) return envelope.data; // plaintext event
 
-      const spec = specFor(envelope.type);
-      if (spec === undefined || spec === "plaintext") {
-        throw new ShreddedDataError(
-          `stream ${streamId}: event type "${envelope.type}" carries keyId ${envelope.keyId} ` +
-            `but has no field annotation to decrypt by`,
-        );
-      }
       const raw = envelope.data;
       if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
         throw new ShreddedDataError(
           `stream ${streamId}: encrypted event "${envelope.type}" has non-object data`,
         );
       }
+      // Marker-driven: decrypt what the stored event carries, not what the
+      // CURRENT config says it should carry — annotations may have changed
+      // since the event was written (see module doc). The marker shape is
+      // reserved at write time, so shape ⇔ ciphertext.
+      const data = { ...(raw as Record<string, unknown>) };
+      const encrypted = Object.entries(data).filter(([, value]) => isFieldEnvelope(value)) as [
+        string,
+        FieldEnvelope,
+      ][];
+      if (encrypted.length === 0) return data; // keyId but nothing encrypted
+
       const subject = await config.subjectFor({ type: envelope.type, data: raw });
       if (subject === null) {
         throw new ShreddedDataError(
@@ -199,19 +265,15 @@ export function fieldEncryptingSerializer(config: FieldEncryptingSerializerConfi
         );
       }
 
-      // null = shredded or undeliverable: substitute the sentinel per field
-      // (degrade, don't destroy the replay — see the module doc).
+      // null = proven shred: substitute the sentinel per field (degrade,
+      // don't destroy the replay — see the module doc). A keyId that was
+      // never minted throws instead of degrading (KeyStore.keyById).
       const key = await config.keys.keyById(subject, envelope.keyId);
-      const data = { ...(raw as Record<string, unknown>) };
-      for (const field of spec) {
-        const value = data[field];
-        // Not a marker: stored plaintext (e.g. the field was annotated after
-        // this event was written) — pass through unchanged.
-        if (!isFieldEnvelope(value)) continue;
+      for (const [field, marker] of encrypted) {
         data[field] =
           key === null
             ? SHREDDED_FIELD
-            : await decryptPayload(key, value.$enc, fieldAad(streamId, envelope.keyId, field));
+            : await decryptPayload(key, marker.$enc, fieldAad(streamId, envelope.keyId, field));
       }
       return data;
     },

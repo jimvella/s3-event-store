@@ -508,6 +508,16 @@ so per-author erasure inside a shared stream needs per-field keys. Shipped as
   no stream-level subject), and an annotated type whose subject resolves
   null refuses too. Plaintext is an explicit `"plaintext"` opt-out per type;
   an empty field list is rejected as ambiguous.
+- **Annotations govern writes only — reads are marker-driven**: deserialize
+  decrypts whatever `{$enc}` markers the stored event actually carries, so
+  config drift (a field de-annotated, a type migrated to `"plaintext"` or
+  dropped) never strands or leaks already-written ciphertext: the log is
+  immutable, the config is not. Two write-time guards keep the markers
+  trustworthy, both before any key is minted: plaintext values may not take
+  the reserved shapes (`{$enc}`/`{$shredded}`), and the subject must still
+  resolve, unchanged, from the marker-substituted data (annotating the
+  subject-bearing field itself would write permanently undecryptable
+  events — refused up front).
 - **Top-level fields only**; each value is replaced by the reserved
   `{ "$enc": "<base64>" }` marker in the shared payload wire format, with
   AAD `{streamId}\n{keyId}\n{field}` — the third segment pins the field and
@@ -519,16 +529,23 @@ so per-author erasure inside a shared stream needs per-field keys. Shipped as
   erases exactly their values while the stream keeps its business meaning
   for everyone else — the Shred-surface pro in the table, realized. A
   ciphertext failing authentication under a *delivered* key stays loud
-  (tampering/transplant, `ShreddedDataError`).
+  (tampering/transplant, `ShreddedDataError`), and so does a keyId naming a
+  generation that was never minted: the tombstone survives hard delete, so
+  "no key object and no tombstone" is a tampered envelope, not an erasure —
+  the key store throws rather than letting rewritten keyIds impersonate a
+  lawful shred.
 - **Deterministic encryption remains refused** (equality search leaks
   patterns; punt to projections), and nested/dynamic field paths stay out
   until a real schema needs them.
 
 Model-B note: the shipped browser client auto-decrypts whole-payload streams
-(its keyring is per-stream — one subject). Field-level model B is
-deployment-owned keyring delivery per subject; the primitives
-(`decryptPayload`, `fieldAad`, `isShreddedField`) are exported from
-`./client` for exactly that.
+(its keyring is per-stream — one subject) and routes by the data's shape, so
+field-encrypted events never hit that per-stream path. Field-level model B is
+deployment-owned key delivery per subject: supply the client's `fieldKeyFor`
+hook to have it decrypt the markers (null from the hook degrades them to the
+shredded sentinel), or omit it to receive markers raw and decrypt by hand —
+the primitives (`decryptPayload`, `fieldAad`, `isFieldEnvelope`,
+`isShreddedField`) are exported from `./client` for exactly that.
 
 ## Key delivery (read model B)
 

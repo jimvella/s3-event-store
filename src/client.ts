@@ -4,7 +4,9 @@
  *
  * Responsibilities: fetch and cache the keyring respecting its TTLs, pick
  * the key per event by the envelope's `keyId`, AES-GCM decrypt fail-closed
- * (a shredded stream presents as decryption failure), cursor iteration,
+ * (a shredded stream presents as decryption failure), field-level
+ * decryption through the deployment's `fieldKeyFor` hook (raw markers
+ * without one — never the per-stream keyring path), cursor iteration,
  * caller-supplied upcasters (client-side is the only upcasting on
  * immutable paths), and an optional fold-to-state helper.
  *
@@ -19,15 +21,22 @@
 
 import { ShreddedDataError } from "./errors.js";
 import { base64ToBytes } from "./crypto/bytes.js";
-import { decryptPayload, payloadAad } from "./crypto/payload.js";
+import { decryptPayload, fieldAad, payloadAad } from "./crypto/payload.js";
+import { isFieldEnvelope, SHREDDED_FIELD } from "./crypto/field-serializer.js";
 import type { EventEnvelope } from "./types.js";
 
-// Model-B field-level decryption is deployment-owned (per-subject keyring
-// delivery has no one-size-fits-all shape), but the primitives are not:
-// a browser decrypts a field marker with
+// Model-B field-level decryption is deployment-owned (per-subject key
+// delivery has no one-size-fits-all shape). Supply `fieldKeyFor` to have
+// the client decrypt field markers; without it they are yielded raw, and
+// the primitives to decrypt one by hand are exported here:
 // `decryptPayload(key, marker.$enc, fieldAad(streamId, keyId, field))`.
 export { decryptPayload, fieldAad, payloadAad } from "./crypto/payload.js";
-export { isShreddedField, SHREDDED_FIELD } from "./crypto/field-serializer.js";
+export {
+  isFieldEnvelope,
+  isShreddedField,
+  SHREDDED_FIELD,
+  type FieldEnvelope,
+} from "./crypto/field-serializer.js";
 
 /** Wire page (DESIGN.md, Wire format). */
 export interface WirePage {
@@ -57,6 +66,16 @@ export interface StreamClientConfig {
   fetchImpl?: (request: Request) => Promise<Response>;
   /** Applied in order after decryption — client-side upcasting. */
   upcasters?: Upcaster[];
+  /**
+   * Field-level decryption hook (fieldEncryptingSerializer streams). The
+   * per-stream keyring endpoint cannot serve these — their keys are
+   * per-SUBJECT, and subject-to-key delivery is deployment-owned. Given a
+   * field-encrypted envelope (object `data` carrying `{$enc}` markers,
+   * `keyId` set), return the key for its `keyId`, or null when the subject
+   * is shredded (each marker degrades to {@link SHREDDED_FIELD}). Omitted:
+   * such envelopes are yielded raw, markers intact.
+   */
+  fieldKeyFor?: (streamId: string, event: EventEnvelope) => Promise<Uint8Array | null> | Uint8Array | null;
   clock?: () => number;
 }
 
@@ -150,6 +169,38 @@ export function createStreamClient(config: StreamClientConfig): StreamClient {
     return key;
   }
 
+  /**
+   * Route by the data's shape, not by keyId alone: whole-payload events
+   * carry string data (one ciphertext), field-encrypted events carry object
+   * data with {$enc} markers — the per-stream keyring only ever applies to
+   * the former.
+   */
+  async function decryptEventData(streamId: string, event: EventEnvelope): Promise<unknown> {
+    if (event.keyId === undefined) return event.data; // plaintext event
+    if (typeof event.data === "string") {
+      return decryptPayload(
+        await keyFor(streamId, event.keyId),
+        event.data,
+        payloadAad(streamId, event.keyId),
+      );
+    }
+    if (typeof event.data !== "object" || event.data === null) return event.data;
+    const encrypted = Object.entries(event.data as Record<string, unknown>).filter(([, value]) =>
+      isFieldEnvelope(value),
+    ) as [string, { $enc: string }][];
+    // No hook: deployment-owned decryption — yield the markers raw.
+    if (encrypted.length === 0 || config.fieldKeyFor === undefined) return event.data;
+    const key = await config.fieldKeyFor(streamId, event);
+    const data = { ...(event.data as Record<string, unknown>) };
+    for (const [field, marker] of encrypted) {
+      data[field] =
+        key === null
+          ? SHREDDED_FIELD
+          : await decryptPayload(key, marker.$enc, fieldAad(streamId, event.keyId, field));
+    }
+    return data;
+  }
+
   async function* read(streamId: string, opts?: ReadOpts): AsyncGenerator<EventEnvelope> {
     const from = opts?.from ?? 0;
     // The one constructed URL: the cold-resume entry point.
@@ -158,15 +209,7 @@ export function createStreamClient(config: StreamClientConfig): StreamClient {
       const page = await fetchPage(url);
       for (const event of page.events) {
         if (event.version < from) continue; // canonical page starts before the cursor
-        const data =
-          event.keyId !== undefined
-            ? await decryptPayload(
-                await keyFor(streamId, event.keyId),
-                event.data as string,
-                payloadAad(streamId, event.keyId),
-              )
-            : event.data;
-        let envelope: EventEnvelope = { ...event, data };
+        let envelope: EventEnvelope = { ...event, data: await decryptEventData(streamId, event) };
         for (const upcast of upcasters) envelope = upcast(envelope);
         yield envelope;
       }

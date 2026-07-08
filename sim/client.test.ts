@@ -11,6 +11,7 @@ import { createStreamClient } from "../src/client";
 import { bytesToBase64 } from "../src/crypto/bytes";
 import { aesMasterKey } from "../src/crypto/master-key";
 import { createS3KeyStore, type KeyStore } from "../src/crypto/keystore";
+import { fieldEncryptingSerializer, isShreddedField } from "../src/crypto/field-serializer";
 import { encryptingSerializer } from "../src/crypto/serializer";
 import { AUDIT_STREAM, requestShred, type ShredContext } from "../src/crypto/shred";
 import { ShreddedDataError } from "../src/errors";
@@ -212,6 +213,64 @@ describe("browser client", () => {
     expect(all.map((e) => e.data)).toEqual([{ n: 0 }, { n: 1 }, { n: 99 }]);
     // The unknown keyId forced exactly one keyring refetch.
     expect(worker.requests.filter((r) => r.endsWith("/key")).length).toBe(2);
+  });
+
+  it("field-encrypted events: raw markers without fieldKeyFor, decrypted with it, sentinel on null", async () => {
+    const eventSim = new SimStore();
+    const keySim = new SimStore();
+    let n = 0;
+    const keys = createS3KeyStore({
+      driver: directDriver(keySim),
+      masterKey: aesMasterKey(SECRET),
+      keyCacheTtlMs: 0,
+      tombstoneTtlMs: 0,
+      keyringTtlMs: 3_600_000,
+    });
+    const fieldStore = createEventStore({
+      driver: directDriver(eventSim),
+      prefix: SIM_PREFIX,
+      chunkSize: PAGE_SIZE,
+      ids: () => `id#${n++}`,
+      serializer: fieldEncryptingSerializer({
+        keys,
+        subjectFor: (event) => (event.data as { author?: string }).author ?? null,
+        fields: { Posted: ["text"] },
+      }),
+    });
+    await fieldStore.append(
+      "room-1",
+      [{ type: "Posted", data: { author: "subject:alice", text: "secret" }, id: "e0" }],
+      { expectedVersion: "noStream" },
+    );
+    const workerStore = createEventStore({
+      driver: directDriver(eventSim),
+      prefix: SIM_PREFIX,
+      chunkSize: PAGE_SIZE,
+      allowReservedStreams: true,
+    });
+    const worker = fakeWorker(workerStore, keys);
+    const cfg = { baseUrl: BASE, auth: () => "test-token", fetchImpl: worker.handler };
+
+    // No hook: markers intact — and never routed at the per-stream keyring.
+    const raw = await collect(createStreamClient(cfg).read("room-1"));
+    expect((raw[0]!.data as { text: { $enc: string } }).text.$enc).toBeTypeOf("string");
+    expect(worker.requests.filter((r) => r.endsWith("/key")).length).toBe(0);
+
+    // Deployment hook: markers decrypt under the per-subject key.
+    const decrypted = await collect(
+      createStreamClient({
+        ...cfg,
+        fieldKeyFor: (_streamId, event) =>
+          keys.keyById((event.data as { author: string }).author, event.keyId!),
+      }).read("room-1"),
+    );
+    expect((decrypted[0]!.data as { text: string }).text).toBe("secret");
+
+    // Hook returning null (shredded subject): fields degrade to the sentinel.
+    const shredded = await collect(
+      createStreamClient({ ...cfg, fieldKeyFor: () => null }).read("room-1"),
+    );
+    expect(isShreddedField((shredded[0]!.data as { text: unknown }).text)).toBe(true);
   });
 
   it("audit stream note: $-streams are readable plaintext without keys", async () => {

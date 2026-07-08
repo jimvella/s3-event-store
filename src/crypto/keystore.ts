@@ -20,7 +20,7 @@
  */
 
 import type { StorageDriver } from "../driver.js";
-import { SubjectErasedError, TransientStoreError } from "../errors.js";
+import { ShreddedDataError, SubjectErasedError, TransientStoreError } from "../errors.js";
 import { base64ToBytes, bytesToBase64, cryptoRandom, type RandomFn } from "./bytes.js";
 import { wrapContext, type MasterKey } from "./master-key.js";
 
@@ -35,7 +35,13 @@ export interface KeyStore {
   /** Newest generation for encryption; lazily mints generation 0. Fails
    * closed (SubjectErasedError) for a soft-deleted subject. */
   currentKey(subjectId: string): Promise<{ keyId: string; key: Uint8Array }>;
-  /** Unwrapped key for decryption; null when shredded or unknown (fail closed). */
+  /**
+   * Unwrapped key for decryption; null when the subject is shredded (fail
+   * closed — readers degrade). A keyId naming a generation that was never
+   * minted throws ShreddedDataError instead: the tombstone survives hard
+   * delete, so "no key object AND no tombstone" is a tampered or corrupt
+   * envelope, never a lawful erasure — it must stay loud, not degrade.
+   */
   keyById(subjectId: string, keyId: string): Promise<Uint8Array | null>;
   /** Every generation the subject has; empty when soft-deleted. */
   keyring(subjectId: string): Promise<KeyringEntry[]>;
@@ -244,7 +250,17 @@ export function createS3KeyStore(config: S3KeyStoreConfig): KeyStore {
       const cached = keyCache.get(cacheKey);
       if (cached && clock() - cached.at < keyCacheTtl) return cached.key;
       const got = await driver.get(generationKey(subjectId, Number(keyId)));
-      if (got.kind !== "found") return null; // shredded: fail closed
+      if (got.kind !== "found") {
+        // Missing generation: a shred is provable (its tombstone is never
+        // deleted), so distinguish before failing closed. Direct read — the
+        // cached state above may be stale against a fresh shred.
+        const t = await readTombstoneDirect(subjectId);
+        if (t !== null && softDeleted(t.state)) return null; // shredded: fail closed
+        throw new ShreddedDataError(
+          `key ${subjectId}/${keyId} was never minted (no key object, no shred tombstone) — ` +
+            `tampered or corrupt keyId`,
+        );
+      }
       const { key } = await unwrapObject(subjectId, Number(keyId), got.body);
       keyCache.set(cacheKey, { key, at: clock() });
       return key;

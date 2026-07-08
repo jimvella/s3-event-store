@@ -229,6 +229,91 @@ describe("field-level serializer end to end", () => {
     const replay = await collect(widened.read(ROOM));
     expect(replay[0]!.data).toMatchObject({ text: "secret", topic: "open" });
   });
+
+  it("refuses to annotate the subject-bearing field: the subject must survive encryption", async () => {
+    const { keys, keySim } = setup();
+    const bad = fieldEncryptingSerializer({
+      keys,
+      subjectFor: (event) => (event.data as { author?: string }).author ?? null,
+      fields: { MessagePosted: ["author", "text"] },
+    });
+    await expect(
+      bad.serialize(ROOM, { type: "MessagePosted", data: { author: ALICE, text: "x" } }),
+    ).rejects.toThrow(/subject-bearing field must stay plaintext/);
+    // Refused before any key-store side effect: nothing minted, no audit.
+    expect(keySim.dump().size).toBe(0);
+  });
+
+  it("refuses plaintext values shaped like reserved markers on encrypted events", async () => {
+    const { store, eventSim } = setup();
+    await expect(
+      store.append(
+        ROOM,
+        [{ type: "MessagePosted", data: { author: ALICE, quoted: { $enc: "spoofed" }, text: "x" }, id: "e0" }],
+        { expectedVersion: "noStream" },
+      ),
+    ).rejects.toThrow(SerializationError);
+    await expect(
+      store.append(
+        ROOM,
+        [{ type: "MessagePosted", data: { author: ALICE, status: { $shredded: true }, text: "x" }, id: "e1" }],
+        { expectedVersion: "noStream" },
+      ),
+    ).rejects.toThrow(SerializationError);
+    expect(eventSim.dump().size).toBe(0);
+  });
+
+  it("config drift never strands ciphertext: reads are marker-driven, not annotation-driven", async () => {
+    const { store, eventSim, keys } = setup();
+    await store.append(
+      ROOM,
+      [
+        {
+          type: "MessagePosted",
+          data: { author: ALICE, messageId: "m-0", text: "secret", attachments: ["a.png"] },
+          id: "e0",
+        },
+      ],
+      { expectedVersion: "noStream" },
+    );
+    const readWith = (fields: Record<string, readonly string[] | "plaintext">) =>
+      createEventStore({
+        driver: directDriver(eventSim),
+        prefix: SIM_PREFIX,
+        chunkSize: 4,
+        serializer: fieldEncryptingSerializer({
+          keys,
+          subjectFor: (event) => (event.data as { author?: string }).author ?? null,
+          fields,
+        }),
+      });
+
+    // Narrowed annotation: the de-annotated field's marker still decrypts.
+    const narrowed = await collect(readWith({ MessagePosted: ["text"] }).read(ROOM));
+    expect(narrowed[0]!.data).toMatchObject({ text: "secret", attachments: ["a.png"] });
+    // Migrated to plaintext, or dropped from the config entirely: same.
+    const plain = await collect(readWith({ MessagePosted: "plaintext" }).read(ROOM));
+    expect(plain[0]!.data).toMatchObject({ text: "secret", attachments: ["a.png"] });
+    const dropped = await collect(readWith({}).read(ROOM));
+    expect(dropped[0]!.data).toMatchObject({ text: "secret", attachments: ["a.png"] });
+  });
+
+  it("a keyId naming a never-minted generation fails loud — tampering cannot impersonate erasure", async () => {
+    const { store, eventSim, keys } = setup();
+    await post(store, ALICE, "alice-words", "noStream", "e0");
+
+    const [chunkKey] = [...eventSim.dump().keys()].filter((k) => k.includes(ROOM));
+    const chunk = JSON.parse(eventSim.dump().get(chunkKey!)!.body) as {
+      commits: { events: { keyId?: string }[] }[];
+    };
+    chunk.commits[0]!.events[0]!.keyId = "999999";
+    eventSim.put(chunkKey!, JSON.stringify(chunk));
+
+    await expect(collect(store.read(ROOM))).rejects.toThrow(/never minted/);
+    // The keystore contract behind it: a proven shred returns null (degrade);
+    // a generation with no key AND no tombstone throws (stay loud).
+    await expect(keys.keyById(ALICE, "999999")).rejects.toThrow(ShreddedDataError);
+  });
 });
 
 describe("field context binding (AAD)", () => {
