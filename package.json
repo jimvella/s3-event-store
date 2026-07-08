@@ -1,6 +1,6 @@
 {
   "name": "@jimvella/s3-event-store",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Event sourcing directly on S3-compatible object storage — no database, no server. Optimistic concurrency via conditional writes; compaction; crypto-shredding erasure.",
   "license": "MIT",
   "repository": {
