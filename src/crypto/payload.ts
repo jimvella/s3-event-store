@@ -46,6 +46,19 @@ export function payloadAad(streamId: string, keyId: string): Uint8Array {
   return utf8.encode(`${streamId}\n${keyId}`);
 }
 
+/**
+ * The context a field ciphertext is bound to (GCM AAD): stream, generation,
+ * and field path — the field-level serializer's counterpart of
+ * {@link payloadAad}. The third segment both pins the field (a `title`
+ * ciphertext moved into `body` fails authentication) and separates the
+ * domains (a field ciphertext can never authenticate as a whole payload or
+ * vice versa). Same deliberate omission of the version, same accepted
+ * residual as payloadAad.
+ */
+export function fieldAad(streamId: string, keyId: string, field: string): Uint8Array {
+  return utf8.encode(`${streamId}\n${keyId}\n${field}`);
+}
+
 export async function encryptPayload(
   rawKey: Uint8Array,
   plaintext: unknown,

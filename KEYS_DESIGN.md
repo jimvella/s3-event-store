@@ -485,16 +485,50 @@ refinement. Trade-offs:
 | Observability | Non-PII fields (types, amounts, references) stay queryable/greppable | — |
 | Shred surface | Only what compliance requires becomes unreadable; replays of shredded streams keep their business meaning | — |
 | Schema coupling | — | Needs a per-event-type annotation mechanism (field paths / decorators); upcasters must understand encrypted fields; nested and dynamic shapes are awkward |
-| Failure mode | — | Forgetting to annotate a field silently leaks plaintext PII forever (immutable!). Default must be fail-closed: unannotated event types get whole-payload encryption, opting *out* is explicit |
+| Failure mode | — | Forgetting to annotate a field silently leaks plaintext PII forever (immutable!). Default must be fail-closed: an unannotated event type refuses to serialize (a multi-author stream has no stream-level subject to fall back to whole-payload under), opting *out* is explicit |
 | Size overhead | — | ~28 bytes + base64 inflation (+33%) **per field** — many small fields cost proportionally more than one whole-payload envelope |
 | Key mapping | Per-user keys become natural (each field tagged with its data subject) | Requires resolving field → data-subject → key at write time |
 | Queryability temptation | — | Equality search over encrypted fields requires deterministic encryption, which leaks equality patterns; refuse this in the library, punt to projections |
 
 **Decision**: the core library defines the serializer interface from day one;
-the whole-payload encrypting serializer + key store ship in roadmap phase 3
-(see DESIGN.md's Roadmap). Field-level is phase 4 with fail-closed defaults,
-only if real demand shows up — it's the kind of API that's expensive to get
-wrong.
+the whole-payload encrypting serializer + key store shipped in roadmap
+phase 3 (see DESIGN.md's Roadmap). Field-level was phase 4, demand-gated —
+and the demand arrived as **multi-author streams** (one stream, many data
+subjects: chat rooms, collaborative debrief logs), a shape the whole-payload
+serializer cannot express at all: its subject is a function of the *stream*,
+so per-author erasure inside a shared stream needs per-field keys. Shipped as
+`fieldEncryptingSerializer` (src/crypto/field-serializer.ts):
+
+- **Subject from the event**, not the stream: `subjectFor(event)`, consulted
+  on write (plaintext in) and read (stored envelope in — the subject must
+  live in the fields that stay plaintext). Per-user keys, tagged per event.
+- **Fail-closed, twice**: an event type absent from the `fields` annotation
+  refuses to serialize (`SerializationError` — the whole-payload fallback the
+  table row above imagined is unavailable, because a multi-author stream has
+  no stream-level subject), and an annotated type whose subject resolves
+  null refuses too. Plaintext is an explicit `"plaintext"` opt-out per type;
+  an empty field list is rejected as ambiguous.
+- **Top-level fields only**; each value is replaced by the reserved
+  `{ "$enc": "<base64>" }` marker in the shared payload wire format, with
+  AAD `{streamId}\n{keyId}\n{field}` — the third segment pins the field and
+  separates the domain from whole-payload AAD. The envelope `keyId` records
+  the one generation for the whole event.
+- **Shredded fields degrade, they don't destroy the replay**: a field whose
+  key is soft- or hard-deleted deserializes to the reserved
+  `{ "$shredded": true }` sentinel (`isShreddedField`), so a shredded author
+  erases exactly their values while the stream keeps its business meaning
+  for everyone else — the Shred-surface pro in the table, realized. A
+  ciphertext failing authentication under a *delivered* key stays loud
+  (tampering/transplant, `ShreddedDataError`).
+- **Deterministic encryption remains refused** (equality search leaks
+  patterns; punt to projections), and nested/dynamic field paths stay out
+  until a real schema needs them.
+
+Model-B note: the shipped browser client auto-decrypts whole-payload streams
+(its keyring is per-stream — one subject). Field-level model B is
+deployment-owned keyring delivery per subject; the primitives
+(`decryptPayload`, `fieldAad`, `isShreddedField`) are exported from
+`./client` for exactly that.
 
 ## Key delivery (read model B)
 

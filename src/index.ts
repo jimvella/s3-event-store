@@ -19,6 +19,13 @@ export {
 export { jsonSerializer, type PayloadSerializer, type SerializedPayload } from "./serializer.js";
 export { encryptingSerializer, type EncryptingSerializerConfig } from "./crypto/serializer.js";
 export {
+  fieldEncryptingSerializer,
+  isShreddedField,
+  SHREDDED_FIELD,
+  type FieldEncryptingSerializerConfig,
+} from "./crypto/field-serializer.js";
+export { decryptPayload, encryptPayload, fieldAad, payloadAad } from "./crypto/payload.js";
+export {
   createS3KeyStore,
   generationKey,
   keyIdOf,

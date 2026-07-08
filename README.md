@@ -59,7 +59,7 @@ service. Everything else is deployment code you own.
 
 | Component | What it is |
 |---|---|
-| **Core library** (`@jimvella/s3-event-store`) | Event store (`append`/`read`), pluggable storage strategy (mutable-tail default; immutable-chunk + `compactStream()` alternative), storage-driver interface, error taxonomy, serializers (including the encrypting one), `KeyStore` interface, shred workflow helpers |
+| **Core library** (`@jimvella/s3-event-store`) | Event store (`append`/`read`), pluggable storage strategy (mutable-tail default; immutable-chunk + `compactStream()` alternative), storage-driver interface, error taxonomy, serializers (including the whole-payload and field-level encrypting ones), `KeyStore` interface, shred workflow helpers |
 | **Storage drivers** (`./drivers/*`) | `aws-sdk` (Node, `@aws-sdk/client-s3` as optional peer), `r2-binding` (native Cloudflare Workers bindings — no SDK weight), `aws4fetch` (lightweight SigV4 for calling S3/R2 from Workers) |
 | **Browser client SDK** (`./client`) | Zero-dependency, WebCrypto-only reader for encrypted streams: keyring fetch/cache, per-event key selection, AES-GCM decrypt, cursor iteration, upcasting |
 | **Your application worker** | Thin HTTP handlers over the library: authenticate → rehydrate → enforce invariants → append. The library ships no routes — auth and invariants are domain concerns |
@@ -262,6 +262,11 @@ return Response.json(toWireHead(head, hrefFor), {
 // POST …/append — raw ingress (only if you expose append instead of domain
 // commands). Clients send stable event ids and an explicit expectedVersion;
 // a retried request that already committed reports success, no duplicate.
+// ("any" is deliberately refused. For event types that never logically
+// conflict — reactions, unique-id inserts, idempotent deletes — absorb
+// contention in the worker instead: on ConcurrencyError, scan forward from
+// the client's stated version for the event ids, then retry at the fresh
+// head. The recipe is in the idempotentAppend docs.)
 const r = await idempotentAppend(store, id, events, { expectedVersion });
 return Response.json(r, { status: r.outcome === "appended" ? 201 : 200 });
 ```
@@ -292,6 +297,46 @@ for await (const event of client.read("order-123", { from: 0 })) {
 Decryption fails closed: a crypto-shredded (GDPR-erased) stream presents
 as decryption failure, never as stale plaintext.
 
+### Field-level encryption — multi-author streams
+
+The whole-payload serializer keys a stream to **one** subject — right when
+each stream has one owner. A shared stream (a chat room, a collaborative
+log) is the other shape: one stream, many authors, and erasure must be
+per-author. `fieldEncryptingSerializer` takes the subject from the **event**
+and encrypts only the annotated fields under that author's key:
+
+```ts
+import { fieldEncryptingSerializer, isShreddedField } from "@jimvella/s3-event-store";
+
+const store = createEventStore({
+  driver,
+  prefix: "app-x",
+  serializer: fieldEncryptingSerializer({
+    keys, // any KeyStore
+    // The erasure unit, resolved from the event's plaintext fields —
+    // consulted on write and on read, so it must not be encrypted itself.
+    subjectFor: (event) => (event.data as { author?: string }).author ?? null,
+    fields: {
+      MessagePosted: ["text"],     // encrypted under the author's key
+      MessageDeleted: "plaintext", // explicit opt-out for structural events
+      // Any type missing from this map REFUSES to store (fail-closed):
+      // the log is immutable, so silently stored plaintext PII is forever.
+    },
+  }),
+});
+```
+
+Identifiers (subjects, message ids) stay plaintext and greppable;
+attributes are ciphertext, each field AAD-bound to its stream, generation,
+and field name so transplants fail authentication. Shredding one author
+erases exactly their values: their fields deserialize to the reserved
+`{ "$shredded": true }` sentinel (test with `isShreddedField`) while the
+stream keeps replaying for everyone else. For model-B reads serve the
+envelopes raw and decrypt in the browser with `decryptPayload` + `fieldAad`
+from `./client` — keyring delivery per subject is deployment code, and
+[the demo](https://github.com/jimvella/s3-event-store-cloudflare-demo)
+shows a complete worked example.
+
 ## Design documents
 
 The full specification — the mutable-tail append protocol, head discovery,
@@ -317,6 +362,9 @@ conformance suite (fake backends always; real endpoints via
 `conformance.local.json`), and the encryption layer per
 [KEYS_DESIGN.md](KEYS_DESIGN.md): AES-256-GCM whole-payload encrypting
 serializer (compress-then-encrypt, random nonces, `keyId` envelopes), the
+field-level encrypting serializer for multi-author streams (per-event
+subjects, fail-closed annotations, per-field AAD, shredded-field
+sentinel), the
 `KeyStore` interface with the S3-key-bucket implementation (wrapped keys,
 generational rotation, tombstone-authoritative reads, TTL-bounded caches,
 startup config verification), and the crypto-shredding workflow
@@ -336,9 +384,8 @@ permanent complete-page caching, upcasters, fold) and the build plumbing
 (`npm run build`: tsup dual ESM/CJS + `.d.ts` for all five subpath
 exports; SDKs as optional peers). Still ahead per [DESIGN.md](DESIGN.md#roadmap):
 MinIO/testcontainers conformance (deferred — real S3 and R2 are covered by
-the file-configured run below), an in-Workers conformance run for the
-r2-binding driver's `onlyIf` semantics, and demand-gated field-level
-encryption.
+the file-configured run below) and an in-Workers conformance run for the
+r2-binding driver's `onlyIf` semantics.
 
 ### Testing
 

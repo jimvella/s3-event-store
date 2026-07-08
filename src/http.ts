@@ -250,8 +250,9 @@ export type IdempotentAppendResult =
    * the versions this append targeted: a previous attempt committed them and
    * its response was lost. `nextExpectedVersion` equals what that attempt
    * would have returned, so the client's cursor advances identically.
-   * (`compactionSuggested` is unavailable on this path — the original
-   * attempt's trigger already fired.)
+   * (`compactionSuggested` is unavailable on this path — moot under the
+   * default mutable-tail strategy, which never compacts; on an ImmutableChunk
+   * prefix the original attempt's write-driven trigger already fired.)
    */
   | { outcome: "alreadyCommitted"; streamId: string; nextExpectedVersion: number };
 
@@ -275,6 +276,23 @@ export type IdempotentAppendResult =
  * once another writer interleaves), so `"any"` + retries would silently
  * double-append. An idempotent raw endpoint therefore requires the client to
  * state its expected version — which the `GET head` poll gives it for free.
+ *
+ * What replaces `"any"` when the worker wants to absorb contention itself —
+ * event types that never logically conflict (per-user last-write-wins
+ * reactions, unique-id inserts, idempotent deletes) shouldn't bounce a 409
+ * to the client just because *some* writer moved the head: wrap this helper
+ * in a bounded retry anchored on the client's stated version. On
+ * `ConcurrencyError`, scan
+ * `store.read(id, { fromVersion: clientVersion + 1, raw: true })` for the
+ * event ids — a prior attempt may have landed anywhere above the client's
+ * version once the loop has re-targeted — and report success if every id is
+ * present; otherwise `resolveHead` and call this helper again at the fresh
+ * head with the same events. The forward scan from a *fixed* lower bound is
+ * exactly what `"any"` lacks: it keeps a lost-response retry distinguishable
+ * from an intentional duplicate at every window the events could occupy.
+ * (Under the default mutable-tail strategy both the scan and the head
+ * resolution are the same few GETs an append does anyway — for the short,
+ * hot streams this pattern suits, the retry is nearly free.)
  *
  * The recovery read is `raw` (envelope `id`s live outside the encryption
  * boundary), so this works on ciphertext-only workers and costs no key

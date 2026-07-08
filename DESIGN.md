@@ -540,7 +540,8 @@ client reads are stream-shaped. Cross-stream queries would add them
 
 **1. Core library (the npm package)** — the only shipped software. Storage
 drivers, event store (append/read), serializers
-(incl. the encrypting one), `KeyStore` interface + S3-bucket implementation,
+(incl. the encrypting ones — whole-payload per-stream and field-level
+per-event), `KeyStore` interface + S3-bucket implementation,
 `compactStream()` + trigger check (ImmutableChunk strategy only), shred
 workflow helpers (crypto and
 erasure behavior: [KEYS_DESIGN.md](KEYS_DESIGN.md)), and the worker-facing
@@ -969,7 +970,7 @@ replay, erasure built in. No two of those coexist in any product found.
 | 1 | Storage-driver interface + `r2-binding`/`aws-sdk`/`aws4fetch` drivers (incl. `onlyIf` conformance tests); the **MutableTail** strategy — `append`/`read` + optimistic concurrency + per-stream N + error taxonomy — + **deterministic simulation harness** + integration tests |
 | 2 | In-process tail cache, the worker-facing HTTP surface (pages/head/idempotent ingress); the **ImmutableChunk** alternative strategy — create-only commits + compaction — behind the per-prefix strategy seam (per [DESIGN_IMMUTABLE_CHUNK.md](DESIGN_IMMUTABLE_CHUNK.md)) |
 | 3 | S3 Express backend, compression + whole-payload crypto-shredding serializer with pluggable key store (per [KEYS_DESIGN.md](KEYS_DESIGN.md)), browser client SDK (`./client`) |
-| 4 | Field-level encryption (fail-closed defaults), if demand warrants |
+| 4 | Field-level encryption (`fieldEncryptingSerializer` — per-event subjects for multi-author streams, fail-closed annotations, shredded-field sentinel; demand arrived via multi-author chat/debrief workloads — see [KEYS_DESIGN.md](KEYS_DESIGN.md), "Whole-payload vs. field-level") |
 
 ## Future work (unplanned)
 

@@ -22,6 +22,13 @@ import { base64ToBytes } from "./crypto/bytes.js";
 import { decryptPayload, payloadAad } from "./crypto/payload.js";
 import type { EventEnvelope } from "./types.js";
 
+// Model-B field-level decryption is deployment-owned (per-subject keyring
+// delivery has no one-size-fits-all shape), but the primitives are not:
+// a browser decrypts a field marker with
+// `decryptPayload(key, marker.$enc, fieldAad(streamId, keyId, field))`.
+export { decryptPayload, fieldAad, payloadAad } from "./crypto/payload.js";
+export { isShreddedField, SHREDDED_FIELD } from "./crypto/field-serializer.js";
+
 /** Wire page (DESIGN.md, Wire format). */
 export interface WirePage {
   streamId: string;
